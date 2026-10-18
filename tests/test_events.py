@@ -25,6 +25,7 @@ def test_schedule_persists_event_and_appointment(client, event):
 
 def test_cancellation_updates_state_and_preserves_history(client, event, connection):
     assert client.post("/events", json=event).status_code == 201
+    before = client.get("/appointments/appt_456").json()
     cancellation = {
         **event,
         "event_id": "evt_002",
@@ -36,6 +37,7 @@ def test_cancellation_updates_state_and_preserves_history(client, event, connect
     appointment = client.get("/appointments/appt_456").json()
     assert appointment["status"] == "CANCELLED"
     assert appointment["last_event_id"] == "evt_002"
+    assert appointment["updated_at"] != before["updated_at"]
     assert client.get("/events/evt_001").json()["event_type"] == event["event_type"]
     assert connection.execute("SELECT count(*) FROM events").fetchone()["count"] == 2
 
@@ -51,18 +53,42 @@ def test_duplicate_id_is_rejected_without_changing_state(client, event, connecti
     assert connection.execute("SELECT count(*) FROM events").fetchone()["count"] == 1
 
 
-def test_patient_conflict_rolls_back_event(client, event):
+@pytest.mark.parametrize("event_type", ["APPOINTMENT_SCHEDULED", "APPOINTMENT_CANCELLED"])
+def test_patient_conflict_rolls_back_event(client, event, event_type):
     assert client.post("/events", json=event).status_code == 201
     before = client.get("/appointments/appt_456").json()
     response = client.post(
-        "/events", json={**event, "event_id": "evt_wrong", "patient_id": "patient_other"}
+        "/events",
+        json={
+            **event,
+            "event_id": "evt_wrong",
+            "patient_id": "patient_other",
+            "event_type": event_type,
+        },
     )
     assert response.status_code == 409
     assert client.get("/events/evt_wrong").status_code == 404
     assert client.get("/appointments/appt_456").json() == before
 
 
-def test_database_failure_rolls_back_both_writes(client, event, connection):
+def test_cancellation_of_missing_appointment_rolls_back_event(client, event, connection):
+    cancellation = {**event, "event_type": "APPOINTMENT_CANCELLED"}
+    response = client.post("/events", json=cancellation)
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Appointment not found for the supplied patient"
+    assert client.get("/events/evt_001").status_code == 404
+    assert client.get("/appointments/appt_456").status_code == 404
+    assert connection.execute("SELECT count(*) FROM events").fetchone()["count"] == 0
+    assert connection.execute("SELECT count(*) FROM appointments").fetchone()["count"] == 0
+
+
+@pytest.mark.parametrize("event_type", ["APPOINTMENT_SCHEDULED", "APPOINTMENT_CANCELLED"])
+def test_database_failure_rolls_back_both_writes(client, event, connection, event_type):
+    before = None
+    if event_type == "APPOINTMENT_CANCELLED":
+        assert client.post("/events", json=event).status_code == 201
+        before = client.get("/appointments/appt_456").json()
+
     connection.execute("""
         CREATE FUNCTION fail_appointment_write() RETURNS trigger
         LANGUAGE plpgsql AS $$
@@ -70,12 +96,17 @@ def test_database_failure_rolls_back_both_writes(client, event, connection):
             RAISE EXCEPTION 'Injected appointment write failure';
         END;
         $$;
-        CREATE TRIGGER fail_write BEFORE INSERT ON appointments
+        CREATE TRIGGER fail_write BEFORE INSERT OR UPDATE ON appointments
         FOR EACH ROW EXECUTE FUNCTION fail_appointment_write();
     """)
-    assert client.post("/events", json=event).status_code == 500
-    assert client.get("/events/evt_001").status_code == 404
-    assert client.get("/appointments/appt_456").status_code == 404
+    failed_event = {**event, "event_id": "evt_failed", "event_type": event_type}
+    assert client.post("/events", json=failed_event).status_code == 500
+    assert client.get("/events/evt_failed").status_code == 404
+    if before is None:
+        assert client.get("/appointments/appt_456").status_code == 404
+    else:
+        assert client.get("/appointments/appt_456").json() == before
+        assert client.get("/events/evt_001").status_code == 200
 
 
 @pytest.mark.parametrize("path", ["/events/missing", "/appointments/missing"])
@@ -122,15 +153,21 @@ def test_offset_timestamp_preserves_instant(client, event):
 
 
 def test_phase_one_applies_delayed_event_in_arrival_order(client, event):
+    assert client.post("/events", json={**event, "event_id": "evt_initial"}).status_code == 201
     cancellation = {
         **event,
         "event_id": "evt_cancel",
         "event_type": "APPOINTMENT_CANCELLED",
-        "event_version": 2,
+        "event_version": 3,
         "occurred_at": "2026-10-17T11:00:00Z",
     }
     assert client.post("/events", json=cancellation).status_code == 201
     assert client.get("/appointments/appt_456").json()["status"] == "CANCELLED"
-    assert client.post("/events", json=event).status_code == 201
+    delayed_schedule = {
+        **event,
+        "event_version": 2,
+        "occurred_at": "2026-10-17T10:30:00Z",
+    }
+    assert client.post("/events", json=delayed_schedule).status_code == 201
     # This documents the Phase 3 ordering problem, rather than solving it early.
     assert client.get("/appointments/appt_456").json()["status"] == "SCHEDULED"

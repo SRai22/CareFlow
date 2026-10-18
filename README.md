@@ -56,7 +56,7 @@ The appointment response has this shape (the timestamp records processing time):
 
 | Endpoint | Success | Errors |
 | --- | --- | --- |
-| `POST /events` | `201`, stored event plus `received_at`; `Location` header | `409` duplicate event ID or patient mismatch; `422` invalid payload |
+| `POST /events` | `201`, stored event plus `received_at`; `Location` header | `409` duplicate event ID, patient mismatch or cancellation of a missing appointment; `422` invalid payload |
 | `GET /events/{id}` | `200`, stored event plus `received_at` | `404` unknown ID; `422` invalid ID |
 | `GET /appointments/{id}` | `200`, current appointment state | `404` unknown ID; `422` invalid ID |
 
@@ -78,26 +78,37 @@ The complete schema is in [app/schema.sql](app/schema.sql).
 
 No patient table is needed: patients are external identifiers and we do not yet
 store patient demographics. No notification table is needed until notification
-work is introduced. Primary keys already index the two GET lookups; no additional
-index is needed for the current queries. Add an `events(appointment_id)` index
-when a query for an appointment's event history is introduced.
+work is introduced. Primary keys index the two GET lookups.
+`idx_events_appointment_id` indexes `events(appointment_id)` for future queries
+that retrieve an appointment's event history.
+
+For databases initialized before this index was added, run the following SQL
+once; do not rerun `app.init_db` on an existing database:
+
+```sql
+CREATE INDEX idx_events_appointment_id
+ON events(appointment_id);
+```
 
 For each valid POST, one PostgreSQL transaction:
 
 1. Inserts the event. The primary key rejects a reused event ID.
 2. Reads the appointment and rejects a different patient ID.
-3. Creates or updates the appointment according to the event type.
+3. Creates or updates a scheduled appointment, or cancels an existing appointment.
+   Updates match both appointment and patient IDs. A cancellation matching zero
+   rows fails and rolls back its event.
 4. Commits both writes before returning `201`. Any failure rolls back both.
 
 | Incoming event | State if appointment is missing | State if appointment exists |
 | --- | --- | --- |
 | `APPOINTMENT_SCHEDULED` | Create `SCHEDULED` | Set `SCHEDULED` |
-| `APPOINTMENT_CANCELLED` | Create `CANCELLED` | Set `CANCELLED` |
+| `APPOINTMENT_CANCELLED` | Reject with `409`; roll back the event | Set `CANCELLED` if patient ID matches |
 
-Cancellation may be the first event we receive. We retain it rather than invent
-a requirement that scheduling must already have arrived. In Phase 1, a delayed
-schedule event can still overwrite that cancellation. There are no transition
-guards or version comparisons yet.
+Cancellation requires an existing appointment belonging to the supplied patient.
+The update changes `status`, `last_event_id` and `updated_at` atomically with the
+event insert. Matching patient IDs enforces data consistency; authorization is
+a separate requirement. In Phase 1, a delayed schedule event can still overwrite
+a cancellation of an existing appointment. Version comparisons remain deferred.
 
 Explicit parameterized SQL keeps the schema, queries and transaction boundary
 visible while learning SQL. Synchronous routes match the synchronous Psycopg
@@ -121,9 +132,23 @@ role needs permission to create schemas. Tests intentionally require PostgreSQL;
 there is no SQLite substitute or silent skip when a database is unavailable.
 
 Coverage includes all three endpoints, input validation, scheduling/cancellation,
-event history, duplicate rejection, patient mismatch rollback, timezone handling,
-and a database trigger that deliberately fails the appointment write to verify
-atomic rollback. A test also records the current arrival-order limitation.
+event history, duplicate rejection, patient mismatch and missing-appointment
+rollback, timezone handling, and a database trigger that deliberately fails
+appointment inserts and cancellation updates to verify atomic rollback. A test
+also records the current arrival-order limitation.
+
+The five Phase 1 transaction checks are in
+[tests/test_transactions.py](tests/test_transactions.py). They call
+[process_event](app/transactions.py) directly and inspect committed data through
+a separate PostgreSQL connection. Missing appointments and patient mismatches
+raise `LookupError`; duplicate IDs raise `UniqueViolation` for `events_pkey`.
+A test-only `CHECK` constraint rejects the cancellation update to prove that its
+event insert also rolls back. The API maps lookup failures and duplicate event
+IDs to `409` after rollback.
+
+```bash
+pytest -v tests/test_transactions.py
+```
 
 ## Deliberate boundaries and next exercises
 
@@ -138,9 +163,10 @@ atomic rollback. A test also records the current arrival-order limitation.
 - Connections are opened per request. Pooling, burst handling, authentication,
   notifications, Kafka, Temporal, Redis and observability are later work.
 
-For the first review, trace the transaction in [app/main.py](app/main.py), then
-send cancellation version 2 before scheduling version 1. Explain why the current
-state is wrong and what information is already stored to fix it in Phase 3.
+For the first review, trace the transaction in [app/transactions.py](app/transactions.py), then
+schedule an appointment with version 1, cancel it with version 3, then send a
+delayed scheduling event with version 2. Explain why the current state is wrong
+and what information is already stored to fix it in Phase 3.
 
 Interview explanation: “I separated accepted event history from current state so
 reads do not replay history. Both writes share a PostgreSQL transaction, so a

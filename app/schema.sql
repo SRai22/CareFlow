@@ -10,6 +10,9 @@ CREATE TABLE events (
     received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE INDEX idx_events_appointment_id
+ON events(appointment_id);
+
 CREATE TABLE appointments (
     appointment_id VARCHAR(128) PRIMARY KEY,
     patient_id VARCHAR(128) NOT NULL,
