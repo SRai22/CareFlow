@@ -1,8 +1,9 @@
 # CareFlow
 
-Phase 1 of an event-driven patient workflow learning project: a synchronous
-FastAPI API backed by PostgreSQL. Python 3.12+ and Docker Compose are required for
-the setup below. Only the database runs in Docker.
+CareFlow Phase 2A: FastAPI persists appointment events in PostgreSQL, publishes
+new events to Kafka, and a separate notification worker uses a durable mock
+provider. Python 3.12+ and Docker Compose are required. PostgreSQL and Kafka run
+in Docker; the API and worker run locally.
 
 ## Run locally
 
@@ -10,8 +11,10 @@ the setup below. Only the database runs in Docker.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
-docker compose up -d --wait db
+docker compose up -d --wait db kafka
+docker compose run --rm kafka-init
 export DATABASE_URL='postgresql://careflow:careflow@localhost:5432/careflow'
+export KAFKA_BOOTSTRAP_SERVERS='localhost:9092'
 python -m app.init_db
 uvicorn app.main:app --reload
 ```
@@ -20,7 +23,21 @@ Run `app.init_db` **once on an empty database**. Schema creation is transactiona
 and fails if the tables already exist; it does not migrate existing tables.
 The named Docker volume retains data across container restarts. `DATABASE_URL`
 is required by the API and initialization command. The credentials in Compose
-are for local development; use synthetic patient identifiers.
+are for local development; use synthetic patient identifiers. Kafka also has a
+named volume, retaining records and committed consumer offsets across restarts.
+Its one-shot storage initializer assigns the volume to UID 1000 before the
+unprivileged broker starts; otherwise a fresh root-owned volume prevents startup.
+
+For an existing Phase 1 database, run the following **once** instead of
+`app.init_db`, before starting the upgraded API or worker:
+
+```bash
+python -m app.migrate_phase2
+```
+
+This adds the notification decision column and both notification/provider
+tables in one transaction. Historical events retain a null notification decision;
+the upgrade does not generate or publish historical notifications.
 
 For a database created before request fingerprints and stored outcomes were
 added, stop the API and run this migration **once**, then restart the API:
@@ -33,6 +50,22 @@ Use the same `DATABASE_URL` as above. The migration adds the three columns and
 backfills existing committed events using the previous fixed `201` event
 response contract. All changes commit together; new databases already include
 these columns through `app.init_db`.
+
+If upgrading an older database, apply `migrate_idempotency` before `migrate_phase2`.
+
+In a second terminal, activate the environment and export the same variables:
+
+```bash
+source .venv/bin/activate
+export DATABASE_URL='postgresql://careflow:careflow@localhost:5432/careflow'
+export KAFKA_BOOTSTRAP_SERVERS='localhost:9092'
+python -m app.worker
+```
+
+The worker subscribes to `appointments.events` in the `notifications` consumer
+group. The topic initializer creates exactly three partitions with replication
+factor one. This is a single-broker local setup. Host clients use `localhost:9092`;
+clients on the Compose network can use `kafka:29092`.
 
 Interactive API docs: <http://127.0.0.1:8000/docs>.
 
@@ -68,7 +101,7 @@ The appointment response has this shape (the timestamp records processing time):
 
 | Endpoint | Success | Errors |
 | --- | --- | --- |
-| `POST /events` | `201`, stored event plus `received_at`; matching retries replay the stored status/body and `Location` | `409` event ID reused with different content or existing appointment on scheduling; `404` cancellation has no matching appointment/patient; `422` invalid payload; `500` unexpected database failure |
+| `POST /events` | `201`, stored event plus `received_at`; new events publish to Kafka; matching retries replay the stored outcome without publishing | `409` conflicting ID or existing appointment; `404` cancellation has no matching appointment/patient; `422` invalid payload; `500` unexpected database failure; `503` publication failed after database commit |
 | `GET /events/{id}` | `200`, stored event plus `received_at` | `404` unknown ID; `422` invalid ID |
 | `GET /appointments/{id}` | `200`, current appointment state | `404` unknown ID; `422` invalid ID |
 
@@ -85,12 +118,13 @@ The complete schema is in [app/schema.sql](app/schema.sql).
 
 | Table | Purpose | Key fields |
 | --- | --- | --- |
-| `events` | Accepted event history and successful request outcomes, with no update/delete endpoint | `event_id` primary key; event fields, `received_at`, `request_hash`, `response_status`, `response_body` |
+| `events` | Accepted event history, successful request outcomes and notification decisions | `event_id` primary key; event fields, `received_at`, `request_hash`, `response_status`, `response_body`, nullable `notification_type` |
 | `appointments` | Current state for quick reads | `appointment_id` primary key; patient ID, status, `last_event_id` foreign key, `updated_at` |
+| `notifications` | Durable notification processing outcomes | `(event_id, notification_type)` primary key; unique `provider_key`, `PENDING`/`SENT`, provider message ID, timestamps |
+| `mock_provider_acceptances` | Independent durable mock provider deduplication | `idempotency_key` primary key; request hash/payload, stable message UUID, acceptance time |
 
 No patient table is needed: patients are external identifiers and we do not yet
-store patient demographics. No notification table is needed until notification
-work is introduced. Primary keys index the two GET lookups.
+store patient demographics. Primary keys index the two GET lookups.
 `idx_events_appointment_id` indexes `events(appointment_id)` for future queries
 that retrieve an appointment's event history.
 
@@ -115,6 +149,11 @@ For each valid POST, one PostgreSQL transaction:
    rows raises `LookupError` and rolls back the event.
 4. Commits both writes before returning `201`. Any failure rolls back both.
 
+After commit, the route publishes only new events to Kafka, keyed by
+`appointment_id`. The payload is the six normalized request fields. HTTP replays
+and rejected transactions do not publish. Producer idempotence protects its own
+retries; it does not replace the consumer's durable deduplication.
+
 | Incoming event | State if appointment is missing | State if appointment exists |
 | --- | --- | --- |
 | `APPOINTMENT_SCHEDULED` | Create `SCHEDULED` | Reject with `409`; roll back the event |
@@ -127,6 +166,64 @@ a separate requirement. Repeated cancellations with distinct event IDs are
 accepted and recorded, including when the appointment is already `CANCELLED`.
 A schedule event targeting an existing appointment is rejected regardless of
 the appointment's status. Version comparisons remain deferred.
+
+## Phase 2A notification processing
+
+The transaction records its notification decision before commit:
+
+| Accepted operation | Notification decision |
+| --- | --- |
+| New scheduling | Confirmation (`APPOINTMENT_SCHEDULED`) |
+| Cancellation changing `SCHEDULED` to `CANCELLED` | Cancellation notice (`APPOINTMENT_CANCELLED`) |
+| Another cancellation when already cancelled | No new notice; the event is still published |
+
+Cancellation locks the appointment row while deciding whether it changes state.
+The decision is persisted on the event, so the worker does not infer historical
+transitions from an appointment's later state. Each Kafka payload must match its
+committed event fingerprint and use the correct appointment key.
+
+For a warranted notification, the worker first commits a unique `PENDING` row.
+It then locks that row, skips an already `SENT` notification, or calls the mock
+provider using the stable key `<event_id>:<notification_type>`. The provider
+records acceptance in a **separate autocommit connection**, so its accepted key
+and message UUID survive a worker rollback or restart. Retrying the same key
+and payload returns that UUID. Reusing a provider key with different content
+fails. There are no external SMS calls.
+
+After provider acceptance, the worker records `SENT` and the message UUID and
+commits PostgreSQL. Here `SENT` means the mock accepted the request. Kafka offset
+`record.offset + 1` is committed synchronously only afterward. Both automatic
+offset commits and automatic offset storage are disabled. An event that warrants
+no notification is acknowledged after the persisted decision is checked.
+
+Database, provider and offset-commit errors get three attempts, with waits of
+one and two seconds. A failed offset commit retries processing safely: `SENT`
+prevents another send. After exhaustion the worker exits nonzero without
+advancing the failed record's offset. Invalid JSON, incorrect keys, fingerprint
+mismatches and unexpected errors fail immediately. Closing the consumer does
+not commit offsets. Repair the cause and restart the worker; it re-reads the
+uncommitted record. There is no dead-letter queue or automatic supervisor yet.
+
+The consumer uses Confluent's documented
+[manual offset commits](https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html#confluent_kafka.Consumer.commit).
+
+## Deliberate database-to-Kafka failure window
+
+Phase 2A publishes directly **after** the PostgreSQL commit. No outbox is used.
+If the process dies between commit and publish, the event and appointment exist
+but no Kafka record is guaranteed. If publication fails or acknowledgement times
+out, the API returns `503` with a detail explicitly stating that the event was
+already committed. The stored `201` outcome describes PostgreSQL success; a
+matching HTTP retry replays it and **does not attempt publication again**.
+The actual broker outcome can also be uncertain after a timeout.
+
+This is intentional: HTTP idempotency does not repair the publication gap.
+An outbox is the next milestone. Broker retries or later manual republication
+can also create duplicate records, which the worker tolerates.
+
+The producer waits for delivery acknowledgement via `flush()` and its delivery
+callback, rather than treating a local enqueue as a successful publish.
+[Confluent producer API](https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html#confluent_kafka.Producer.produce)
 
 The request uses the Pydantic `EventCreate` model in
 [app/schemas.py](app/schemas.py). FastAPI validates the body before executing the
@@ -175,10 +272,11 @@ The lookup indexes come from PostgreSQL's
 
 ## Verify
 
-With PostgreSQL running:
+With PostgreSQL and Kafka running and the topic initialized:
 
 ```bash
 export TEST_DATABASE_URL='postgresql://careflow:careflow@localhost:5432/careflow'
+export TEST_KAFKA_BOOTSTRAP_SERVERS='localhost:9092'
 pytest -q
 ```
 
@@ -186,6 +284,10 @@ Tests use a unique temporary PostgreSQL schema per test and remove only that
 schema afterward. Existing application tables and data are untouched. The test
 role needs permission to create schemas. Tests intentionally require PostgreSQL;
 there is no SQLite substitute or silent skip when a database is unavailable.
+Broker tests create and delete their own topics and use isolated consumer groups.
+They also verify that the configured `appointments.events` topic has three
+partitions. If `TEST_KAFKA_BOOTSTRAP_SERVERS` is unset, broker-dependent tests are
+explicitly skipped; set it as above for the complete integration suite.
 
 Coverage includes all three endpoints, input validation, scheduling/cancellation,
 event history, conflicting payload rejection, patient mismatch and missing-appointment
@@ -210,9 +312,47 @@ event ID, timezone and JSON order normalization, retries after later state
 changes, concurrent identical and conflicting requests, retry after failure,
 and migration of historical events.
 
+The concurrency test holds Worker A's row uncommitted and observes Worker B
+waiting through `pg_blocking_pids` before committing A. B then raises a duplicate
+violation, exits the transaction context (which rolls back), and only afterward
+reads A's committed outcome. Querying before that rollback would fail and make
+the replay test fail.
+
 ```bash
 pytest -v tests/test_transactions.py
 ```
+
+The first Phase 2A acceptance check is
+`tests/test_kafka.py::test_post_commits_then_publishes_keyed_event_once`: it
+persists `appt_123`, reads its Kafka payload and key, then verifies an identical
+HTTP retry produces no second record. The automated test uses an isolated topic
+with the same three-partition setup to avoid polluting the development worker.
+To inspect the real topic while making requests against the running API:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 --describe --topic appointments.events
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka:29092 --topic appointments.events \
+  --from-beginning --property print.key=true
+```
+
+[tests/test_notifications.py](tests/test_notifications.py) covers duplicate Kafka
+records, independent appointments, committed offsets surviving a real consumer
+close/recreation, skipped repeated-cancellation notices, provider failures,
+poison records, and a crash after durable provider acceptance but before the
+worker records success. The last case restarts the consumer with the same group
+and proves the provider acceptance count stays one.
+
+## Phase 2A checklist
+
+- [x] Local Kafka and a three-partition `appointments.events` topic.
+- [x] Publish new events after commit, keyed by appointment ID; skip HTTP replays.
+- [x] Separate `notifications` consumer worker.
+- [x] Durable `PENDING`/`SENT` outcomes with a unique event/type key.
+- [x] Durable mock provider idempotency keys and acceptance results.
+- [x] Manual offsets, bounded retries and an explicit stop-on-error policy.
+- [x] PostgreSQL/Kafka integration tests and failure injection.
 
 ## Deliberate boundaries and next exercises
 
@@ -226,8 +366,10 @@ pytest -v tests/test_transactions.py
 - `occurred_at` and `event_version` are stored without sequence enforcement.
 - If a response is lost after commit, retrying the same ID and payload recovers
   the original successful response without applying the operation again.
+- Direct publication can fail after database commit; an HTTP replay does not
+  heal it. The outbox pattern remains deliberately deferred.
 - Connections are opened per request. Pooling, burst handling, authentication,
-  notifications, Kafka, Temporal, Redis and observability are later work.
+  Temporal, Redis and observability are later work.
 
 For the first review, trace both transactions in
 [app/transactions.py](app/transactions.py), then cancel an unknown appointment.
@@ -241,5 +383,7 @@ failure cannot leave an event recorded without its state change. Constraints
 guard IDs and allowed values. A normalized request fingerprint distinguishes
 retries from conflicting reuse of an event ID, and the successful response is
 persisted in that same transaction. The API replays that outcome without
-reapplying the operation. Processing remains synchronous; ordering, delivery
-recovery and broader concurrency guarantees are follow-up milestones.”
+reapplying the operation or publishing another record. New events publish to
+Kafka after commit. A separate worker stores notification outcomes and calls a
+durable idempotent mock provider before committing Kafka offsets. Direct
+publication intentionally leaves a crash window for the outbox milestone.”

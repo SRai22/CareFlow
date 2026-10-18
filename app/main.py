@@ -7,11 +7,13 @@ from psycopg.errors import UniqueViolation
 
 from app.db import get_connection
 from app.idempotency import request_hash
+from app.kafka import KafkaPublisher, PublishError, get_publisher
 from app.schemas import AppointmentRead, EventCreate, EventRead, Identifier
 from app.transactions import cancel_appointment, schedule_appointment
 
 app = FastAPI(title="CareFlow", version="0.1.0")
 Connection = Annotated[psycopg.Connection[dict[str, Any]], Depends(get_connection)]
+Publisher = Annotated[KafkaPublisher, Depends(get_publisher)]
 
 
 @app.post(
@@ -22,9 +24,11 @@ Connection = Annotated[psycopg.Connection[dict[str, Any]], Depends(get_connectio
         404: {"description": "Appointment not found for the supplied patient"},
         409: {"description": "Event ID reused with different content or appointment already exists"},
         500: {"description": "Internal server error"},
+        503: {"description": "Event committed, but Kafka publication failed"},
     },
 )
-def create_event(event: EventCreate, connection: Connection):
+def create_event(event: EventCreate, connection: Connection, publisher: Publisher):
+    replayed = False
     try:
         if event.event_type == "APPOINTMENT_SCHEDULED":
             stored = schedule_appointment(event, connection)
@@ -42,10 +46,22 @@ def create_event(event: EventCreate, connection: Connection):
                 raise
             if stored["request_hash"] != request_hash(event):
                 raise HTTPException(409, "Event ID already exists with a different payload") from exc
+            replayed = True
         elif exc.diag.constraint_name == "appointments_pkey":
             raise HTTPException(409, "Appointment already exists") from exc
         else:
             raise
+
+    if not replayed:
+        # shortcut: a crash after commit can lose publication; add an outbox next.
+        try:
+            publisher.publish(event)
+        except PublishError as exc:
+            raise HTTPException(
+                503,
+                "Event committed, but Kafka publication failed. "
+                "An HTTP replay will not republish it.",
+            ) from exc
 
     return JSONResponse(
         status_code=stored["response_status"],

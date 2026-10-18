@@ -10,6 +10,20 @@ from psycopg.conninfo import make_conninfo
 from psycopg.rows import dict_row
 
 from app.main import app
+from app.kafka import get_publisher
+
+
+class RecordingPublisher:
+    def __init__(self):
+        self.events = []
+
+    def publish(self, event):
+        self.events.append(event)
+
+
+@pytest.fixture
+def publisher():
+    return RecordingPublisher()
 
 
 @pytest.fixture
@@ -23,9 +37,10 @@ def database_url(monkeypatch):
         test_url = make_conninfo(url, options=f"-csearch_path={schema}")
         try:
             with psycopg.connect(test_url) as connection:
-                connection.execute(
-                    (Path(__file__).parents[1] / "app/schema.sql").read_text()
-                )
+                for filename in ("schema.sql", "notification_schema.sql"):
+                    connection.execute(
+                        (Path(__file__).parents[1] / "app" / filename).read_text()
+                    )
             monkeypatch.setenv("DATABASE_URL", test_url)
             yield test_url
         finally:
@@ -42,9 +57,13 @@ def connection(database_url):
 
 
 @pytest.fixture
-def client(database_url):
-    with TestClient(app, raise_server_exceptions=False) as test_client:
-        yield test_client
+def client(database_url, publisher):
+    app.dependency_overrides[get_publisher] = lambda: publisher
+    try:
+        with TestClient(app, raise_server_exceptions=False) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.pop(get_publisher, None)
 
 
 @pytest.fixture

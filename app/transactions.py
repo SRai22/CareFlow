@@ -8,7 +8,9 @@ from app.schemas import EventCreate, EventRead
 
 
 def _insert_event(
-    event: EventCreate, connection: psycopg.Connection[dict[str, Any]]
+    event: EventCreate,
+    connection: psycopg.Connection[dict[str, Any]],
+    notification_type: str | None = None,
 ) -> dict[str, Any]:
     received_at = connection.execute("SELECT CURRENT_TIMESTAMP AS received_at").fetchone()[
         "received_at"
@@ -19,11 +21,11 @@ def _insert_event(
         INSERT INTO events (
             event_id, patient_id, appointment_id,
             event_type, event_version, occurred_at, received_at,
-            request_hash, response_status, response_body
+            request_hash, response_status, response_body, notification_type
         ) VALUES (
             %(event_id)s, %(patient_id)s, %(appointment_id)s,
             %(event_type)s, %(event_version)s, %(occurred_at)s, %(received_at)s,
-            %(request_hash)s, 201, %(response_body)s
+            %(request_hash)s, 201, %(response_body)s, %(notification_type)s
         ) RETURNING *
         """,
         {
@@ -31,6 +33,7 @@ def _insert_event(
             "received_at": received_at,
             "request_hash": request_hash(event),
             "response_body": Jsonb(outcome),
+            "notification_type": notification_type,
         },
     ).fetchone()
 
@@ -39,7 +42,7 @@ def schedule_appointment(
     event: EventCreate, connection: psycopg.Connection[dict[str, Any]]
 ) -> dict[str, Any]:
     with connection.transaction():
-        stored = _insert_event(event, connection)
+        stored = _insert_event(event, connection, notification_type="APPOINTMENT_SCHEDULED")
         connection.execute(
             """
             INSERT INTO appointments (
@@ -57,6 +60,17 @@ def cancel_appointment(
 ) -> dict[str, Any]:
     with connection.transaction():
         stored = _insert_event(event, connection)
+        # Serialize this transition so concurrent cancellations cannot both warrant a notice.
+        previous = connection.execute(
+            """
+            SELECT status FROM appointments
+            WHERE appointment_id = %(appointment_id)s AND patient_id = %(patient_id)s
+            FOR UPDATE
+            """,
+            event.model_dump(),
+        ).fetchone()
+        if previous is None:
+            raise LookupError("Appointment not found for the supplied patient")
         result = connection.execute(
             """
             UPDATE appointments
@@ -69,5 +83,13 @@ def cancel_appointment(
         )
         if result.rowcount == 0:
             raise LookupError("Appointment not found for the supplied patient")
+        if previous["status"] == "SCHEDULED":
+            stored = connection.execute(
+                """
+                UPDATE events SET notification_type = 'APPOINTMENT_CANCELLED'
+                WHERE event_id = %s RETURNING *
+                """,
+                (event.event_id,),
+            ).fetchone()
 
     return stored

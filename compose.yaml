@@ -15,5 +15,52 @@ services:
       timeout: 5s
       retries: 15
 
+  kafka-storage-init:
+    image: apache/kafka:4.2.0
+    user: "0:0"
+    entrypoint: ["chown", "1000:1000", "/tmp/kraft-combined-logs"]
+    volumes:
+      - kafka_data:/tmp/kraft-combined-logs
+
+  kafka:
+    image: apache/kafka:4.2.0
+    depends_on:
+      kafka-storage-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:9092:9092"
+    environment:
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:29092,HOST://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    volumes:
+      - kafka_data:/tmp/kraft-combined-logs
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "kafka:29092", "--list"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  kafka-init:
+    image: apache/kafka:4.2.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
+    command: ["--bootstrap-server", "kafka:29092", "--create", "--if-not-exists", "--topic", "appointments.events", "--partitions", "3", "--replication-factor", "1"]
+
 volumes:
   postgres_data:
+  kafka_data:

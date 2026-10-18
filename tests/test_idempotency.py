@@ -1,9 +1,13 @@
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from time import monotonic, sleep
 
+import psycopg
 import pytest
+from psycopg.rows import dict_row
 
 from app.migrate_idempotency import migrate
+from app.schemas import EventCreate
+from app.transactions import schedule_appointment
 
 
 def snapshot(connection):
@@ -95,30 +99,50 @@ def test_failed_request_has_no_outcome_and_can_succeed_later(client, event, conn
 
 
 @pytest.mark.parametrize("different_payload", [False, True])
-def test_concurrent_retries_commit_one_event_and_appointment(
-    client, event, connection, different_payload
+def test_duplicate_waits_for_commit_then_rolls_back_before_replay(
+    client, event, connection, database_url, different_payload
 ):
     other = {**event, "appointment_id": "appt_other"} if different_payload else event
-    ready = Barrier(2)
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        with psycopg.connect(database_url, autocommit=True, row_factory=dict_row) as observer:
+            # An outer transaction keeps A's inserts uncommitted after its savepoint exits.
+            with connection.transaction():
+                original = schedule_appointment(EventCreate(**event), connection)
+                pending = worker.submit(client.post, "/events", json=other)
 
-    def send(payload):
-        ready.wait(timeout=10)
-        return client.post("/events", json=payload)
+                deadline = monotonic() + 5
+                while monotonic() < deadline:
+                    blocked = observer.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1 FROM pg_stat_activity
+                            WHERE %s = ANY(pg_blocking_pids(pid))
+                        ) AS blocked
+                        """,
+                        (connection.info.backend_pid,),
+                    ).fetchone()["blocked"]
+                    if blocked:
+                        break
+                    sleep(0.01)
+                else:
+                    pytest.fail("Worker B did not wait on Worker A's uncommitted insert")
 
-    with ThreadPoolExecutor(max_workers=2) as workers:
-        futures = [workers.submit(send, payload) for payload in (event, other)]
-        responses = [future.result(timeout=15) for future in futures]
+                assert not pending.done()
+                assert snapshot(observer) == ([], [])
 
-    assert sorted(response.status_code for response in responses) == (
-        [201, 409] if different_payload else [201, 201]
-    )
+            # A commits here; B must roll back its UniqueViolation before its SELECT.
+            response = pending.result(timeout=10)
+
+    assert response.status_code == (409 if different_payload else 201)
     events, appointments = snapshot(connection)
     assert len(events) == len(appointments) == 1
-    successful = next(response for response in responses if response.status_code == 201)
-    assert events[0]["response_body"] == successful.json()
-    assert appointments[0]["appointment_id"] == successful.json()["appointment_id"]
-    if not different_payload:
-        assert responses[0].content == responses[1].content
+    assert events == [original]
+    assert appointments[0]["appointment_id"] == event["appointment_id"]
+    if different_payload:
+        assert response.json()["detail"] == "Event ID already exists with a different payload"
+    else:
+        assert response.json() == original["response_body"]
+        assert response.headers["location"] == f"/events/{event['event_id']}"
 
 
 def test_migration_backfills_existing_success_for_replay(client, event, connection):

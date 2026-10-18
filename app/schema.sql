@@ -10,7 +10,10 @@ CREATE TABLE events (
     received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     request_hash CHAR(64) NOT NULL,
     response_status SMALLINT NOT NULL CHECK (response_status BETWEEN 100 AND 599),
-    response_body JSONB NOT NULL
+    response_body JSONB NOT NULL,
+    notification_type TEXT CHECK (
+        notification_type IN ('APPOINTMENT_SCHEDULED', 'APPOINTMENT_CANCELLED')
+    )
 );
 
 CREATE INDEX idx_events_appointment_id
