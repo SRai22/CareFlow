@@ -7,7 +7,10 @@ CREATE TABLE events (
     ),
     event_version INTEGER NOT NULL CHECK (event_version > 0),
     occurred_at TIMESTAMPTZ NOT NULL,
-    received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    request_hash CHAR(64) NOT NULL,
+    response_status SMALLINT NOT NULL CHECK (response_status BETWEEN 100 AND 599),
+    response_body JSONB NOT NULL
 );
 
 CREATE INDEX idx_events_appointment_id

@@ -1,0 +1,49 @@
+import psycopg
+from psycopg.types.json import Jsonb
+
+from app.db import open_connection
+from app.idempotency import request_hash
+from app.schemas import EventCreate, EventRead
+
+
+def migrate(connection: psycopg.Connection) -> None:
+    # Historical successes used the same fixed 201 response contract.
+    with connection.transaction():
+        connection.execute("""
+            ALTER TABLE events
+                ADD COLUMN request_hash CHAR(64),
+                ADD COLUMN response_status SMALLINT CHECK (response_status BETWEEN 100 AND 599),
+                ADD COLUMN response_body JSONB
+        """)
+        events = connection.execute("""
+            SELECT event_id, patient_id, appointment_id, event_type,
+                   event_version, occurred_at, received_at
+            FROM events
+        """).fetchall()
+        for stored in events:
+            event = EventCreate(**{name: stored[name] for name in EventCreate.model_fields})
+            outcome = EventRead(**stored).model_dump(mode="json")
+            connection.execute(
+                """
+                UPDATE events
+                SET request_hash = %s, response_status = 201, response_body = %s
+                WHERE event_id = %s
+                """,
+                (request_hash(event), Jsonb(outcome), event.event_id),
+            )
+        connection.execute("""
+            ALTER TABLE events
+                ALTER COLUMN request_hash SET NOT NULL,
+                ALTER COLUMN response_status SET NOT NULL,
+                ALTER COLUMN response_body SET NOT NULL
+        """)
+
+
+def main() -> None:
+    with open_connection() as connection:
+        migrate(connection)
+    print("Added request fingerprints and stored outcomes to CareFlow events.")
+
+
+if __name__ == "__main__":
+    main()

@@ -4,7 +4,7 @@ from psycopg.errors import CheckViolation, UniqueViolation
 from psycopg.rows import dict_row
 
 from app.schemas import EventCreate
-from app.transactions import process_event
+from app.transactions import cancel_appointment, schedule_appointment
 
 
 @pytest.fixture
@@ -15,7 +15,7 @@ def observer(database_url):
 
 @pytest.fixture
 def scheduled_appointment(connection, event):
-    process_event(EventCreate(**event), connection)
+    schedule_appointment(EventCreate(**event), connection)
 
 
 @pytest.fixture
@@ -42,7 +42,7 @@ def test_successful_cancellation_commits_both_changes(
     connection, observer, scheduled_appointment, cancellation
 ):
     before = snapshot(observer)
-    stored = process_event(cancellation, connection)
+    stored = cancel_appointment(cancellation, connection)
     events, appointments = snapshot(observer)
 
     assert len(events) == 2
@@ -58,7 +58,7 @@ def test_unknown_appointment_raises_lookup_error_and_rolls_back(
 ):
     before = snapshot(observer)
     with pytest.raises(LookupError, match="Appointment not found"):
-        process_event(cancellation, connection)
+        cancel_appointment(cancellation, connection)
     assert snapshot(observer) == before
 
 
@@ -68,7 +68,7 @@ def test_duplicate_event_id_raises_unique_violation_without_changes(
     before = snapshot(observer)
     duplicate = cancellation.model_copy(update={"event_id": event["event_id"]})
     with pytest.raises(UniqueViolation) as error:
-        process_event(duplicate, connection)
+        cancel_appointment(duplicate, connection)
     assert error.value.diag.constraint_name == "events_pkey"
     assert snapshot(observer) == before
 
@@ -78,8 +78,8 @@ def test_wrong_patient_rolls_back_without_changes(
 ):
     before = snapshot(observer)
     wrong_patient = cancellation.model_copy(update={"patient_id": "patient_other"})
-    with pytest.raises(LookupError, match="another patient"):
-        process_event(wrong_patient, connection)
+    with pytest.raises(LookupError, match="Appointment not found"):
+        cancel_appointment(wrong_patient, connection)
     assert snapshot(observer) == before
 
 
@@ -93,6 +93,6 @@ def test_constraint_failure_rolls_back_event_and_appointment_update(
     """)
     before = snapshot(observer)
     with pytest.raises(CheckViolation) as error:
-        process_event(cancellation, connection)
+        cancel_appointment(cancellation, connection)
     assert error.value.diag.constraint_name == "test_reject_cancellation"
     assert snapshot(observer) == before

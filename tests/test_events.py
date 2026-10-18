@@ -42,19 +42,25 @@ def test_cancellation_updates_state_and_preserves_history(client, event, connect
     assert connection.execute("SELECT count(*) FROM events").fetchone()["count"] == 2
 
 
-def test_duplicate_id_is_rejected_without_changing_state(client, event, connection):
+def test_duplicate_id_with_different_content_conflicts_without_changing_state(
+    client, event, connection
+):
     assert client.post("/events", json=event).status_code == 201
     before = client.get("/appointments/appt_456").json()
-    for payload in [event, {**event, "event_type": "APPOINTMENT_CANCELLED"}]:
-        response = client.post("/events", json=payload)
-        assert response.status_code == 409
-        assert response.json()["detail"] == "Event ID already exists"
+    response = client.post(
+        "/events", json={**event, "event_type": "APPOINTMENT_CANCELLED"}
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Event ID already exists with a different payload"
     assert client.get("/appointments/appt_456").json() == before
     assert connection.execute("SELECT count(*) FROM events").fetchone()["count"] == 1
 
 
-@pytest.mark.parametrize("event_type", ["APPOINTMENT_SCHEDULED", "APPOINTMENT_CANCELLED"])
-def test_patient_conflict_rolls_back_event(client, event, event_type):
+@pytest.mark.parametrize(
+    ("event_type", "expected_status"),
+    [("APPOINTMENT_SCHEDULED", 409), ("APPOINTMENT_CANCELLED", 404)],
+)
+def test_patient_conflict_rolls_back_event(client, event, event_type, expected_status):
     assert client.post("/events", json=event).status_code == 201
     before = client.get("/appointments/appt_456").json()
     response = client.post(
@@ -66,7 +72,7 @@ def test_patient_conflict_rolls_back_event(client, event, event_type):
             "event_type": event_type,
         },
     )
-    assert response.status_code == 409
+    assert response.status_code == expected_status
     assert client.get("/events/evt_wrong").status_code == 404
     assert client.get("/appointments/appt_456").json() == before
 
@@ -74,7 +80,7 @@ def test_patient_conflict_rolls_back_event(client, event, event_type):
 def test_cancellation_of_missing_appointment_rolls_back_event(client, event, connection):
     cancellation = {**event, "event_type": "APPOINTMENT_CANCELLED"}
     response = client.post("/events", json=cancellation)
-    assert response.status_code == 409
+    assert response.status_code == 404
     assert response.json()["detail"] == "Appointment not found for the supplied patient"
     assert client.get("/events/evt_001").status_code == 404
     assert client.get("/appointments/appt_456").status_code == 404
@@ -152,22 +158,64 @@ def test_offset_timestamp_preserves_instant(client, event):
     )
 
 
-def test_phase_one_applies_delayed_event_in_arrival_order(client, event):
-    assert client.post("/events", json={**event, "event_id": "evt_initial"}).status_code == 201
-    cancellation = {
+@pytest.mark.parametrize("cancel_first", [False, True])
+def test_scheduling_existing_appointment_conflicts_and_rolls_back(
+    client, event, connection, cancel_first
+):
+    assert client.post("/events", json=event).status_code == 201
+    if cancel_first:
+        cancellation = {
+            **event,
+            "event_id": "evt_cancel",
+            "event_type": "APPOINTMENT_CANCELLED",
+            "event_version": 3,
+        }
+        assert client.post("/events", json=cancellation).status_code == 201
+    before = client.get("/appointments/appt_456").json()
+    reschedule = {
         **event,
-        "event_id": "evt_cancel",
-        "event_type": "APPOINTMENT_CANCELLED",
-        "event_version": 3,
-        "occurred_at": "2026-10-17T11:00:00Z",
-    }
-    assert client.post("/events", json=cancellation).status_code == 201
-    assert client.get("/appointments/appt_456").json()["status"] == "CANCELLED"
-    delayed_schedule = {
-        **event,
+        "event_id": "evt_reschedule",
         "event_version": 2,
         "occurred_at": "2026-10-17T10:30:00Z",
     }
-    assert client.post("/events", json=delayed_schedule).status_code == 201
-    # This documents the Phase 3 ordering problem, rather than solving it early.
-    assert client.get("/appointments/appt_456").json()["status"] == "SCHEDULED"
+    response = client.post("/events", json=reschedule)
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Appointment already exists"
+    assert client.get("/events/evt_reschedule").status_code == 404
+    assert client.get("/appointments/appt_456").json() == before
+    assert connection.execute("SELECT count(*) FROM events").fetchone()["count"] == (
+        2 if cancel_first else 1
+    )
+
+
+def test_repeated_cancellation_with_new_event_id_is_accepted(client, event, connection):
+    assert client.post("/events", json=event).status_code == 201
+    for version in (2, 3):
+        cancellation = {
+            **event,
+            "event_id": f"evt_cancel_{version}",
+            "event_type": "APPOINTMENT_CANCELLED",
+            "event_version": version,
+        }
+        assert client.post("/events", json=cancellation).status_code == 201
+    appointment = client.get("/appointments/appt_456").json()
+    assert appointment["status"] == "CANCELLED"
+    assert appointment["last_event_id"] == "evt_cancel_3"
+    assert connection.execute("SELECT count(*) FROM events").fetchone()["count"] == 3
+
+
+def test_unrelated_unique_violation_is_not_mapped_to_conflict(client, event, connection):
+    assert client.post("/events", json=event).status_code == 201
+    before = client.get("/appointments/appt_456").json()
+    connection.execute(
+        "ALTER TABLE appointments ADD CONSTRAINT test_unique_patient UNIQUE (patient_id)"
+    )
+    response = client.post(
+        "/events",
+        json={**event, "event_id": "evt_failed", "appointment_id": "appt_other"},
+    )
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+    assert client.get("/events/evt_failed").status_code == 404
+    assert client.get("/appointments/appt_other").status_code == 404
+    assert client.get("/appointments/appt_456").json() == before

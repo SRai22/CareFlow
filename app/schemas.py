@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 Identifier = Annotated[
     str, StringConstraints(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
@@ -17,6 +17,11 @@ class EventCreate(BaseModel):
     event_type: Literal["APPOINTMENT_SCHEDULED", "APPOINTMENT_CANCELLED"]
     event_version: Annotated[int, Field(strict=True, gt=0, le=2_147_483_647)]
     occurred_at: AwareDatetime
+
+    @field_validator("occurred_at")
+    @classmethod
+    def normalize_occurred_at(cls, value: datetime) -> datetime:
+        return value.astimezone(timezone.utc)
 
 
 class EventRead(EventCreate):

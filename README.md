@@ -22,6 +22,18 @@ The named Docker volume retains data across container restarts. `DATABASE_URL`
 is required by the API and initialization command. The credentials in Compose
 are for local development; use synthetic patient identifiers.
 
+For a database created before request fingerprints and stored outcomes were
+added, stop the API and run this migration **once**, then restart the API:
+
+```bash
+python -m app.migrate_idempotency
+```
+
+Use the same `DATABASE_URL` as above. The migration adds the three columns and
+backfills existing committed events using the previous fixed `201` event
+response contract. All changes commit together; new databases already include
+these columns through `app.init_db`.
+
 Interactive API docs: <http://127.0.0.1:8000/docs>.
 
 ```bash
@@ -56,7 +68,7 @@ The appointment response has this shape (the timestamp records processing time):
 
 | Endpoint | Success | Errors |
 | --- | --- | --- |
-| `POST /events` | `201`, stored event plus `received_at`; `Location` header | `409` duplicate event ID, patient mismatch or cancellation of a missing appointment; `422` invalid payload |
+| `POST /events` | `201`, stored event plus `received_at`; matching retries replay the stored status/body and `Location` | `409` event ID reused with different content or existing appointment on scheduling; `404` cancellation has no matching appointment/patient; `422` invalid payload; `500` unexpected database failure |
 | `GET /events/{id}` | `200`, stored event plus `received_at` | `404` unknown ID; `422` invalid ID |
 | `GET /appointments/{id}` | `200`, current appointment state | `404` unknown ID; `422` invalid ID |
 
@@ -73,7 +85,7 @@ The complete schema is in [app/schema.sql](app/schema.sql).
 
 | Table | Purpose | Key fields |
 | --- | --- | --- |
-| `events` | Accepted event history, with no update/delete endpoint | `event_id` primary key; patient/appointment IDs, type, version, `occurred_at`, `received_at` |
+| `events` | Accepted event history and successful request outcomes, with no update/delete endpoint | `event_id` primary key; event fields, `received_at`, `request_hash`, `response_status`, `response_body` |
 | `appointments` | Current state for quick reads | `appointment_id` primary key; patient ID, status, `last_event_id` foreign key, `updated_at` |
 
 No patient table is needed: patients are external identifiers and we do not yet
@@ -92,23 +104,67 @@ ON events(appointment_id);
 
 For each valid POST, one PostgreSQL transaction:
 
-1. Inserts the event. The primary key rejects a reused event ID.
-2. Reads the appointment and rejects a different patient ID.
-3. Creates or updates a scheduled appointment, or cancels an existing appointment.
-   Updates match both appointment and patient IDs. A cancellation matching zero
-   rows fails and rolls back its event.
+1. Inserts the event, normalized request hash and successful HTTP outcome. These
+   remain uncommitted until the appointment write succeeds. The primary key
+   rejects a reused event ID.
+2. Routes `APPOINTMENT_SCHEDULED` to `schedule_appointment`, which inserts a new
+   appointment. Its primary key rejects an existing appointment without an
+   existence query.
+3. Routes `APPOINTMENT_CANCELLED` to `cancel_appointment`, which updates only an
+   existing appointment matching both appointment and patient IDs. Matching zero
+   rows raises `LookupError` and rolls back the event.
 4. Commits both writes before returning `201`. Any failure rolls back both.
 
 | Incoming event | State if appointment is missing | State if appointment exists |
 | --- | --- | --- |
-| `APPOINTMENT_SCHEDULED` | Create `SCHEDULED` | Set `SCHEDULED` |
-| `APPOINTMENT_CANCELLED` | Reject with `409`; roll back the event | Set `CANCELLED` if patient ID matches |
+| `APPOINTMENT_SCHEDULED` | Create `SCHEDULED` | Reject with `409`; roll back the event |
+| `APPOINTMENT_CANCELLED` | Reject with `404`; roll back the event | Set `CANCELLED` if patient ID matches; otherwise `404` |
 
 Cancellation requires an existing appointment belonging to the supplied patient.
 The update changes `status`, `last_event_id` and `updated_at` atomically with the
 event insert. Matching patient IDs enforces data consistency; authorization is
-a separate requirement. In Phase 1, a delayed schedule event can still overwrite
-a cancellation of an existing appointment. Version comparisons remain deferred.
+a separate requirement. Repeated cancellations with distinct event IDs are
+accepted and recorded, including when the appointment is already `CANCELLED`.
+A schedule event targeting an existing appointment is rejected regardless of
+the appointment's status. Version comparisons remain deferred.
+
+The request uses the Pydantic `EventCreate` model in
+[app/schemas.py](app/schemas.py). FastAPI validates the body before executing the
+route. `UniqueViolation` on `events_pkey` enters the retry comparison described
+below; `appointments_pkey` becomes `409`. Other database errors propagate as
+`500` without exposing SQL details.
+
+## Idempotent retries
+
+`event_id` identifies a logical request. `request_hash` is SHA-256 of the
+validated payload serialized with sorted JSON keys and no formatting whitespace.
+All six request fields participate. `occurred_at` is normalized to UTC, so
+equivalent timezone offsets and JSON field order produce the same fingerprint.
+
+The event row also stores `response_status` and `response_body` (JSONB). They
+commit atomically with the appointment change. No `PROCESSING` state is needed
+under this transaction contract. Timestamps describe source and recording times;
+the stored outcome determines the response to a retry.
+
+The API first attempts the insert, retaining the primary key as the concurrency
+guard. If `events_pkey` raises `UniqueViolation`, the transaction rolls back
+before the API reads the existing row:
+
+- Same hash: return the stored successful status and body, with the original
+  `Location`, without changing the appointment or recording another event.
+- Different hash: return `409`; neither the original event nor appointment is
+  changed.
+
+PostgreSQL's uniqueness check makes a competing insert wait for the first
+transaction's outcome. If it commits, the retry reads the stored outcome; if it
+rolls back, the waiting insert can proceed. There is no pre-insert existence
+query. Retries of an old scheduling event still replay its original result even
+if a later cancellation has changed the appointment's current state.
+
+Only successful requests are retained. Validation errors, lookup failures,
+appointment conflicts and database failures leave no successful outcome for the
+new event ID. The internal fingerprint and response columns are not exposed by
+`GET /events/{id}`.
 
 Explicit parameterized SQL keeps the schema, queries and transaction boundary
 visible while learning SQL. Synchronous routes match the synchronous Psycopg
@@ -132,19 +188,27 @@ role needs permission to create schemas. Tests intentionally require PostgreSQL;
 there is no SQLite substitute or silent skip when a database is unavailable.
 
 Coverage includes all three endpoints, input validation, scheduling/cancellation,
-event history, duplicate rejection, patient mismatch and missing-appointment
+event history, conflicting payload rejection, patient mismatch and missing-appointment
 rollback, timezone handling, and a database trigger that deliberately fails
-appointment inserts and cancellation updates to verify atomic rollback. A test
-also records the current arrival-order limitation.
+appointment inserts and cancellation updates to verify atomic rollback. Tests
+also cover scheduling conflicts for both scheduled and cancelled appointments,
+repeated cancellations, and an unrelated unique constraint returning `500`.
 
 The five Phase 1 transaction checks are in
 [tests/test_transactions.py](tests/test_transactions.py). They call
-[process_event](app/transactions.py) directly and inspect committed data through
+[the transaction functions](app/transactions.py) directly and inspect committed data through
 a separate PostgreSQL connection. Missing appointments and patient mismatches
 raise `LookupError`; duplicate IDs raise `UniqueViolation` for `events_pkey`.
 A test-only `CHECK` constraint rejects the cancellation update to prove that its
-event insert also rolls back. The API maps lookup failures and duplicate event
-IDs to `409` after rollback.
+event insert also rolls back. The API maps cancellation lookup failures to `404`
+and appointment conflicts to `409` after rollback. A raw transaction call still
+raises `UniqueViolation` for duplicate event IDs; the API handles outcome replay.
+
+[tests/test_idempotency.py](tests/test_idempotency.py) covers matching retries of
+scheduling and cancellation, all five possible changed fields under the same
+event ID, timezone and JSON order normalization, retries after later state
+changes, concurrent identical and conflicting requests, retry after failure,
+and migration of historical events.
 
 ```bash
 pytest -v tests/test_transactions.py
@@ -152,25 +216,30 @@ pytest -v tests/test_transactions.py
 
 ## Deliberate boundaries and next exercises
 
-- Duplicate IDs return `409`, including retries with identical payloads. This is
-  uniqueness enforcement, not a retry-safe idempotency contract.
-- State follows sequential request arrival order. Concurrent requests are not
-  ordered: updates can overwrite each other, and simultaneous creation of the
-  same appointment can produce a database uniqueness error and `500`.
-- `occurred_at` and `event_version` are stored but do not prevent stale updates.
-- A commit followed by a lost HTTP response leaves the client uncertain whether
-  its request succeeded. It can inspect `GET /events/{id}`; a retry gets `409`.
+- Successful retries replay their persisted outcomes; reusing an ID for a
+  different normalized payload returns `409`. Outcomes currently have no expiry.
+- Cancellation before scheduling returns `404` and is rolled back; there is no
+  buffering or replay. Concurrent cancellation requests are not ordered by
+  version. Simultaneous attempts to schedule the same appointment are resolved
+  by its primary key: different event IDs conflict, while identical requests
+  under the same event ID replay the successful result.
+- `occurred_at` and `event_version` are stored without sequence enforcement.
+- If a response is lost after commit, retrying the same ID and payload recovers
+  the original successful response without applying the operation again.
 - Connections are opened per request. Pooling, burst handling, authentication,
   notifications, Kafka, Temporal, Redis and observability are later work.
 
-For the first review, trace the transaction in [app/transactions.py](app/transactions.py), then
-schedule an appointment with version 1, cancel it with version 3, then send a
-delayed scheduling event with version 2. Explain why the current state is wrong
-and what information is already stored to fix it in Phase 3.
+For the first review, trace both transactions in
+[app/transactions.py](app/transactions.py), then cancel an unknown appointment.
+Explain why neither the event nor an appointment persists. Next, schedule an
+appointment and try scheduling it again with a different event ID; explain why
+the appointment primary key causes a conflict and rolls back the new event.
 
 Interview explanation: “I separated accepted event history from current state so
 reads do not replay history. Both writes share a PostgreSQL transaction, so a
 failure cannot leave an event recorded without its state change. Constraints
-guard IDs and allowed values. The first version deliberately applies events
-synchronously; ordering, safe retries and concurrency control are explicit
-follow-up milestones.”
+guard IDs and allowed values. A normalized request fingerprint distinguishes
+retries from conflicting reuse of an event ID, and the successful response is
+persisted in that same transaction. The API replays that outcome without
+reapplying the operation. Processing remains synchronous; ordering, delivery
+recovery and broader concurrency guarantees are follow-up milestones.”
