@@ -17,11 +17,13 @@ class EventCreate(BaseModel):
     event_type: Literal["APPOINTMENT_SCHEDULED", "APPOINTMENT_CANCELLED"]
     event_version: Annotated[int, Field(strict=True, gt=0, le=2_147_483_647)]
     occurred_at: AwareDatetime
+    # Nullable for historical events; new scheduling transactions require a future value.
+    scheduled_for: AwareDatetime | None = None
 
-    @field_validator("occurred_at")
+    @field_validator("occurred_at", "scheduled_for")
     @classmethod
-    def normalize_occurred_at(cls, value: datetime) -> datetime:
-        return value.astimezone(timezone.utc)
+    def normalize_timestamps(cls, value: datetime | None) -> datetime | None:
+        return value.astimezone(timezone.utc) if value is not None else None
 
 
 class EventRead(EventCreate):
@@ -34,3 +36,4 @@ class AppointmentRead(BaseModel):
     status: Literal["SCHEDULED", "CANCELLED"]
     last_event_id: str
     updated_at: datetime
+    scheduled_for: datetime | None = None

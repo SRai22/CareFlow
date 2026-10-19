@@ -20,6 +20,7 @@ def test_schedule_persists_event_and_appointment(client, event):
         "status": "SCHEDULED",
         "last_event_id": "evt_001",
         "updated_at": appointment.json()["updated_at"],
+        "scheduled_for": event["scheduled_for"],
     }
 
 

@@ -5,5 +5,6 @@ from app.schemas import EventCreate
 
 
 def request_hash(event: EventCreate) -> str:
-    canonical = json.dumps(event.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    # Omitting absent optional fields preserves fingerprints of pre-migration requests.
+    canonical = json.dumps(event.model_dump(mode="json", exclude_none=True), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

@@ -16,13 +16,11 @@ def migrate(connection: psycopg.Connection) -> None:
                 ADD COLUMN response_body JSONB
         """)
         events = connection.execute("""
-            SELECT event_id, patient_id, appointment_id, event_type,
-                   event_version, occurred_at, received_at
-            FROM events
+            SELECT * FROM events
         """).fetchall()
         for stored in events:
-            event = EventCreate(**{name: stored[name] for name in EventCreate.model_fields})
-            outcome = EventRead(**stored).model_dump(mode="json")
+            event = EventCreate(**{name: stored[name] for name in EventCreate.model_fields if name in stored})
+            outcome = EventRead(**event.model_dump(), received_at=stored["received_at"]).model_dump(mode="json", exclude_none=True)
             connection.execute(
                 """
                 UPDATE events

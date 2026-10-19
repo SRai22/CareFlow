@@ -7,6 +7,7 @@ CREATE TABLE events (
     ),
     event_version INTEGER NOT NULL CHECK (event_version > 0),
     occurred_at TIMESTAMPTZ NOT NULL,
+    scheduled_for TIMESTAMPTZ,
     received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     request_hash CHAR(64) NOT NULL,
     response_status SMALLINT NOT NULL CHECK (response_status BETWEEN 100 AND 599),
@@ -24,5 +25,6 @@ CREATE TABLE appointments (
     patient_id VARCHAR(128) NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('SCHEDULED', 'CANCELLED')),
     last_event_id VARCHAR(128) NOT NULL REFERENCES events(event_id),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    scheduled_for TIMESTAMPTZ
 );

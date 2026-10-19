@@ -7,6 +7,7 @@ from confluent_kafka import Consumer, KafkaException
 from app.db import open_connection
 from app.kafka import TOPIC, bootstrap_servers
 from app.schemas import EventCreate
+from app.temporal_client import TemporalHandoffError
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ def process_record(consumer, record, handler, *, checkpoint=None) -> None:
             if checkpoint is not None:
                 checkpoint("after_commit", record)
             return
-        except (psycopg.Error, KafkaException):
+        except (psycopg.Error, KafkaException, TemporalHandoffError):
             if attempt == 2:
                 raise
             logger.warning("Processing failed for event %s; retrying", event.event_id, exc_info=True)

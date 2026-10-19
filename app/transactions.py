@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Any
 
 import psycopg
@@ -5,6 +6,10 @@ from psycopg.types.json import Jsonb
 
 from app.idempotency import request_hash
 from app.schemas import EventCreate, EventRead
+
+
+class InvalidSchedule(ValueError):
+    pass
 
 
 def _insert_event(
@@ -15,16 +20,16 @@ def _insert_event(
     received_at = connection.execute("SELECT CURRENT_TIMESTAMP AS received_at").fetchone()[
         "received_at"
     ]
-    outcome = EventRead(**event.model_dump(), received_at=received_at).model_dump(mode="json")
+    outcome = EventRead(**event.model_dump(), received_at=received_at).model_dump(mode="json", exclude_none=True)
     stored = connection.execute(
         """
         INSERT INTO events (
             event_id, patient_id, appointment_id,
-            event_type, event_version, occurred_at, received_at,
+            event_type, event_version, occurred_at, scheduled_for, received_at,
             request_hash, response_status, response_body, notification_type
         ) VALUES (
             %(event_id)s, %(patient_id)s, %(appointment_id)s,
-            %(event_type)s, %(event_version)s, %(occurred_at)s, %(received_at)s,
+            %(event_type)s, %(event_version)s, %(occurred_at)s, %(scheduled_for)s, %(received_at)s,
             %(request_hash)s, 201, %(response_body)s, %(notification_type)s
         ) RETURNING *
         """,
@@ -41,7 +46,7 @@ def _insert_event(
         INSERT INTO outbox (event_id, appointment_id, payload)
         VALUES (%s, %s, %s)
         """,
-        (event.event_id, event.appointment_id, Jsonb(event.model_dump(mode="json"))),
+        (event.event_id, event.appointment_id, Jsonb(event.model_dump(mode="json", exclude_none=True))),
     )
     return stored
 
@@ -51,11 +56,14 @@ def schedule_appointment(
 ) -> dict[str, Any]:
     with connection.transaction():
         stored = _insert_event(event, connection, notification_type="APPOINTMENT_SCHEDULED")
+        # Insert first so committed retries still replay after their appointment time passes.
+        if event.scheduled_for is None or event.scheduled_for <= datetime.now(timezone.utc):
+            raise InvalidSchedule("APPOINTMENT_SCHEDULED requires a future scheduled_for timestamp")
         connection.execute(
             """
             INSERT INTO appointments (
-                appointment_id, patient_id, status, last_event_id
-            ) VALUES (%(appointment_id)s, %(patient_id)s, 'SCHEDULED', %(event_id)s)
+                appointment_id, patient_id, status, last_event_id, scheduled_for
+            ) VALUES (%(appointment_id)s, %(patient_id)s, 'SCHEDULED', %(event_id)s, %(scheduled_for)s)
             """,
             event.model_dump(),
         )

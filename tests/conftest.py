@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -70,6 +71,7 @@ def event():
         "event_type": "APPOINTMENT_SCHEDULED",
         "event_version": 1,
         "occurred_at": "2026-10-17T10:00:00Z",
+        "scheduled_for": (datetime.now(timezone.utc) + timedelta(days=2)).isoformat().replace("+00:00", "Z"),
     }
 
 

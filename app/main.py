@@ -8,7 +8,7 @@ from psycopg.errors import UniqueViolation
 from app.db import get_connection
 from app.idempotency import request_hash
 from app.schemas import AppointmentRead, EventCreate, EventRead, Identifier
-from app.transactions import cancel_appointment, schedule_appointment
+from app.transactions import InvalidSchedule, cancel_appointment, schedule_appointment
 
 app = FastAPI(title="CareFlow", version="0.1.0")
 Connection = Annotated[psycopg.Connection[dict[str, Any]], Depends(get_connection)]
@@ -32,6 +32,8 @@ def create_event(event: EventCreate, connection: Connection):
             stored = cancel_appointment(event, connection)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+    except InvalidSchedule as exc:
+        raise HTTPException(422, str(exc)) from exc
     except UniqueViolation as exc:
         if exc.diag.constraint_name == "events_pkey":
             # The failed transaction has rolled back before reading the winning outcome.
@@ -54,12 +56,12 @@ def create_event(event: EventCreate, connection: Connection):
     )
 
 
-@app.get("/events/{id}", response_model=EventRead)
+@app.get("/events/{id}", response_model=EventRead, response_model_exclude_none=True)
 def get_event(id: Identifier, connection: Connection):
     event = connection.execute(
         """
         SELECT event_id, patient_id, appointment_id, event_type,
-               event_version, occurred_at, received_at
+               event_version, occurred_at, scheduled_for, received_at
         FROM events WHERE event_id = %s
         """,
         (id,),

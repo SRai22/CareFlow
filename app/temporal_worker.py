@@ -5,7 +5,7 @@ import logging
 
 from temporalio.worker import Worker
 
-from app.temporal_client import TASK_QUEUE, connect_client
+from app.temporal_client import connect_client, reminder_queue
 from app.workflows.appointment_reminder import AppointmentReminderWorkflow
 
 
@@ -18,7 +18,7 @@ async def run(task_queue: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the CareFlow Temporal workflow worker")
-    parser.add_argument("--task-queue", default=TASK_QUEUE)
+    parser.add_argument("--task-queue", default=reminder_queue())
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     try:
