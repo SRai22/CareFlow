@@ -1,237 +1,194 @@
 import json
-import os
-from time import monotonic
-from types import SimpleNamespace
 from uuid import uuid4
 
+import psycopg
 import pytest
-from confluent_kafka import OFFSET_INVALID, TopicPartition
-from confluent_kafka.admin import AdminClient, NewTopic
+from confluent_kafka import KafkaException, OFFSET_INVALID
 
-from app import notifications, worker
-from app.kafka import KafkaPublisher
+from app import worker
+from app.consumers import analytics, notifications
 from app.migrate_phase2 import migrate
-from app.mock_provider import ProviderError
-from app.schemas import EventCreate
+from app.outbox_publisher import publish_one
 
 
-@pytest.fixture
-def kafka_notifications(client, publisher, monkeypatch):
-    servers = os.environ.get("TEST_KAFKA_BOOTSTRAP_SERVERS")
-    if not servers:
-        pytest.skip("Set TEST_KAFKA_BOOTSTRAP_SERVERS to run real Kafka tests")
-    topic = f"careflow-test-{uuid4().hex}"
-    group = f"notifications-test-{uuid4().hex}"
-    admin = AdminClient({"bootstrap.servers": servers})
-    admin.create_topics([NewTopic(topic, num_partitions=3, replication_factor=1)])[topic].result(15)
-    actual = KafkaPublisher(servers, topic=topic)
-    monkeypatch.setattr(publisher, "publish", actual.publish)
-    consumers = []
-
-    def create():
-        consumer = worker.create_consumer(servers, group_id=group, topic=topic)
-        consumers.append(consumer)
-        return consumer
-
-    def restart(consumer):
-        consumer.close()
-        consumers.remove(consumer)
-        return create()
-
-    try:
-        yield SimpleNamespace(publisher=actual, consumer=create, restart=restart)
-    finally:
-        for consumer in consumers:
-            consumer.close()
-        admin.delete_topics([topic])[topic].result(15)
-
-
-def read_record(consumer):
-    deadline = monotonic() + 15
-    while monotonic() < deadline:
-        record = consumer.poll(0.2)
-        if record is not None:
-            assert record.error() is None
-            return record
-    pytest.fail("Notification consumer did not receive a record")
-
-
-def committed_offset(consumer, record):
-    position = consumer.committed(
-        [TopicPartition(record.topic(), record.partition())], timeout=5
-    )[0]
-    assert position.error is None
-    return position.offset
-
-
-def test_duplicate_kafka_records_send_one_notification(
-    client, event, connection, kafka_notifications
-):
+@pytest.mark.parametrize("handler,table", [
+    (notifications.process_event, "notifications"),
+    (analytics.process_event, "analytics_events"),
+])
+def test_duplicate_deliveries_persist_once(client, event, connection, kafka, handler, table):
     assert client.post("/events", json=event).status_code == 201
-    kafka_notifications.publisher.publish(EventCreate(**event))
-    consumer = kafka_notifications.consumer()
-    first = read_record(consumer)
-    worker.process_record(consumer, first)
-    duplicate = read_record(consumer)
-    assert duplicate.partition() == first.partition()
-    assert duplicate.offset() == first.offset() + 1
-    worker.process_record(consumer, duplicate)
-
-    assert connection.execute("SELECT count(*) FROM notifications").fetchone()["count"] == 1
-    assert connection.execute("SELECT status FROM notifications").fetchone()["status"] == "SENT"
-    assert connection.execute("SELECT count(*) FROM mock_provider_acceptances").fetchone()["count"] == 1
-    assert committed_offset(consumer, duplicate) == duplicate.offset() + 1
+    assert publish_one(connection, kafka.publisher)
+    kafka.publisher.publish(connection.execute("SELECT * FROM outbox").fetchone())
+    consumer = kafka.consumer()
+    for _ in range(2):
+        record = kafka.read(consumer)
+        worker.process_record(consumer, record, handler)
+    assert kafka.offset(consumer, record) == record.offset() + 1
+    assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()["count"] == 1
+    assert connection.execute("SELECT count(*) FROM mock_provider_acceptances").fetchone()["count"] == 0
 
 
-def test_consumer_restart_recovers_committed_offset(
-    client, event, connection, kafka_notifications
-):
-    assert client.post("/events", json=event).status_code == 201
-    consumer = kafka_notifications.consumer()
-    first = read_record(consumer)
-    worker.process_record(consumer, first)
-    consumer = kafka_notifications.restart(consumer)
-    assert committed_offset(consumer, first) == first.offset() + 1
-
-    second = {**event, "event_id": "evt_second", "appointment_id": "appt_other"}
-    assert client.post("/events", json=second).status_code == 201
-    record = read_record(consumer)
-    assert json.loads(record.value())["event_id"] == second["event_id"]
-    worker.process_record(consumer, record)
-    assert connection.execute("SELECT count(*) FROM notifications").fetchone()["count"] == 2
-
-
-def test_independent_appointments_have_independent_notifications(
-    client, event, connection, kafka_notifications
-):
+def test_independent_consumer_groups_each_receive_every_event(client, event, connection, kafka):
     other = {**event, "event_id": "evt_other", "appointment_id": "appt_other"}
     for payload in (event, other):
         assert client.post("/events", json=payload).status_code == 201
-    consumer = kafka_notifications.consumer()
-    keys = set()
-    for _ in range(2):
-        record = read_record(consumer)
-        keys.add(record.key())
-        worker.process_record(consumer, record)
-    assert keys == {b"appt_456", b"appt_other"}
-    outcomes = connection.execute("SELECT * FROM notifications").fetchall()
-    assert {row["event_id"] for row in outcomes} == {event["event_id"], other["event_id"]}
-    assert all(row["status"] == "SENT" for row in outcomes)
-    assert len({row["provider_key"] for row in outcomes}) == 2
-    assert connection.execute("SELECT count(*) FROM mock_provider_acceptances").fetchone()["count"] == 2
+        assert publish_one(connection, kafka.publisher)
+    for module in (notifications, analytics):
+        consumer = kafka.consumer(f"{module.GROUP_ID}-{uuid4().hex}")
+        keys = set()
+        for _ in range(2):
+            record = kafka.read(consumer)
+            keys.add(record.key())
+            worker.process_record(consumer, record, module.process_event)
+        assert keys == {b"appt_456", b"appt_other"}
+    assert connection.execute("SELECT count(*) FROM analytics_events").fetchone()["count"] == 2
+    intents = connection.execute("SELECT * FROM notifications").fetchall()
+    assert len(intents) == 2
+    assert all(row["status"] == "PENDING" for row in intents)
+    assert connection.execute("SELECT count(*) FROM mock_provider_acceptances").fetchone()["count"] == 0
 
 
-def test_repeated_cancellation_is_published_but_does_not_warrant_another_notice(
-    client, event, connection, kafka_notifications
+@pytest.mark.parametrize("handler,table", [
+    (notifications.process_event, "notifications"),
+    (analytics.process_event, "analytics_events"),
+])
+def test_consumer_restart_after_database_commit_before_offset_commit(
+    client, event, connection, kafka, handler, table
 ):
     assert client.post("/events", json=event).status_code == 201
-    for version in (2, 3):
-        payload = {
-            **event,
-            "event_id": f"evt_cancel_{version}",
-            "event_type": "APPOINTMENT_CANCELLED",
-            "event_version": version,
-        }
+    assert publish_one(connection, kafka.publisher)
+    group = f"restart-{uuid4().hex}"
+    consumer = kafka.consumer(group)
+    record = kafka.read(consumer)
+
+    class CrashBeforeCommit:
+        def commit(self, **kwargs):
+            raise RuntimeError("injected crash before offset commit")
+    with pytest.raises(RuntimeError, match="before offset"):
+        worker.process_record(CrashBeforeCommit(), record, handler)
+    assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()["count"] == 1
+    assert kafka.offset(consumer, record) == OFFSET_INVALID
+    kafka.close(consumer)
+    consumer = kafka.consumer(group)
+    replay = kafka.read(consumer)
+    assert (replay.partition(), replay.offset()) == (record.partition(), record.offset())
+    worker.process_record(consumer, replay, handler)
+    assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()["count"] == 1
+    assert kafka.offset(consumer, replay) == replay.offset() + 1
+    kafka.close(consumer)
+    consumer = kafka.consumer(group)
+    assert kafka.offset(consumer, replay) == replay.offset() + 1
+    other = {**event, "event_id": "evt_other", "appointment_id": "appt_other"}
+    assert client.post("/events", json=other).status_code == 201
+    assert publish_one(connection, kafka.publisher)
+    next_record = kafka.read(consumer)
+    assert json.loads(next_record.value())["event_id"] == "evt_other"
+    worker.process_record(consumer, next_record, handler)
+
+
+def test_repeated_cancellation_only_warrants_one_cancellation_intent(client, event, connection, kafka):
+    for payload in (event, *[
+        {**event, "event_id": f"evt_cancel_{v}", "event_type": "APPOINTMENT_CANCELLED", "event_version": v}
+        for v in (2, 3)
+    ]):
         assert client.post("/events", json=payload).status_code == 201
-
-    consumer = kafka_notifications.consumer()
-    for _ in range(3):
-        record = read_record(consumer)
-        worker.process_record(consumer, record)
-    assert committed_offset(consumer, record) == record.offset() + 1
-    outcomes = connection.execute("SELECT * FROM notifications").fetchall()
-    assert {row["event_id"] for row in outcomes} == {"evt_001", "evt_cancel_2"}
-    assert connection.execute("SELECT count(*) FROM mock_provider_acceptances").fetchone()["count"] == 2
-    assert connection.execute(
-        "SELECT notification_type FROM events WHERE event_id = 'evt_cancel_3'"
-    ).fetchone()["notification_type"] is None
+        assert publish_one(connection, kafka.publisher)
+    for module in (notifications, analytics):
+        consumer = kafka.consumer()
+        for _ in range(3):
+            worker.process_record(consumer, kafka.read(consumer), module.process_event)
+    intents = connection.execute("SELECT * FROM notifications").fetchall()
+    assert {row["event_id"] for row in intents} == {"evt_001", "evt_cancel_2"}
+    assert connection.execute("SELECT count(*) FROM analytics_events").fetchone()["count"] == 3
+    assert connection.execute("SELECT count(*) FROM mock_provider_acceptances").fetchone()["count"] == 0
 
 
-def test_crash_after_provider_acceptance_recovers_without_duplicate_send(
-    client, event, connection, kafka_notifications, monkeypatch
+@pytest.mark.parametrize("handler,table", [
+    (notifications.process_event, "notifications"),
+    (analytics.process_event, "analytics_events"),
+])
+def test_database_failure_retries_then_stops_without_committing(
+    client, event, connection, kafka, monkeypatch, handler, table
 ):
     assert client.post("/events", json=event).status_code == 201
-    consumer = kafka_notifications.consumer()
-    record = read_record(consumer)
-
-    def crash_before_marking_sent(*args):
-        raise RuntimeError("Injected crash after provider acceptance")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(notifications, "mark_sent", crash_before_marking_sent)
-        with pytest.raises(RuntimeError, match="after provider acceptance"):
-            worker.process_record(consumer, record)
-
-    pending = connection.execute("SELECT * FROM notifications").fetchone()
-    accepted = connection.execute("SELECT * FROM mock_provider_acceptances").fetchone()
-    assert pending["status"] == "PENDING"
-    assert accepted["idempotency_key"] == pending["provider_key"]
-    assert committed_offset(consumer, record) == OFFSET_INVALID
-
-    # New Kafka consumer and new database connections; provider acceptance survives.
-    consumer = kafka_notifications.restart(consumer)
-    retry = read_record(consumer)
-    assert (retry.partition(), retry.offset()) == (record.partition(), record.offset())
-    worker.process_record(consumer, retry)
-    sent = connection.execute("SELECT * FROM notifications").fetchone()
-    assert sent["status"] == "SENT"
-    assert sent["provider_message_id"] == accepted["message_id"]
-    assert sent["created_at"] == pending["created_at"]
-    assert connection.execute("SELECT count(*) FROM mock_provider_acceptances").fetchone()["count"] == 1
-    assert committed_offset(consumer, retry) == retry.offset() + 1
+    assert publish_one(connection, kafka.publisher)
+    connection.execute(f"ALTER TABLE {table} ADD CONSTRAINT injected_failure CHECK (event_id <> 'evt_001')")
+    consumer = kafka.consumer()
+    record = kafka.read(consumer)
+    sleeps = []
+    monkeypatch.setattr(worker, "sleep", sleeps.append)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        worker.process_record(consumer, record, handler)
+    assert sleeps == [1, 2]
+    assert kafka.offset(consumer, record) == OFFSET_INVALID
+    assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()["count"] == 0
+    connection.execute(f"ALTER TABLE {table} DROP CONSTRAINT injected_failure")
+    worker.process_record(consumer, record, handler)
+    assert kafka.offset(consumer, record) == record.offset() + 1
 
 
-def test_provider_failure_retries_three_times_without_advancing_offset(
-    client, event, connection, kafka_notifications, monkeypatch
+@pytest.mark.parametrize("invalid", ["json", "key", "payload"])
+def test_invalid_record_never_commits_and_reappears_after_restart(
+    client, event, connection, kafka, invalid
 ):
     assert client.post("/events", json=event).status_code == 201
-    consumer = kafka_notifications.consumer()
-    record = read_record(consumer)
-    attempts = []
-
-    def unavailable(key, payload):
-        attempts.append(key)
-        raise ProviderError("Injected provider outage")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(notifications, "send_notification", unavailable)
-        patch.setattr(worker, "sleep", lambda seconds: None)
-        with pytest.raises(ProviderError):
-            worker.process_record(consumer, record)
-
-    assert len(attempts) == 3
-    assert len(set(attempts)) == 1
-    assert committed_offset(consumer, record) == OFFSET_INVALID
-    assert connection.execute("SELECT status FROM notifications").fetchone()["status"] == "PENDING"
-    consumer = kafka_notifications.restart(consumer)
-    retry = read_record(consumer)
-    worker.process_record(consumer, retry)
-    assert connection.execute("SELECT status FROM notifications").fetchone()["status"] == "SENT"
-    assert committed_offset(consumer, retry) == retry.offset() + 1
-
-
-def test_invalid_record_does_not_commit_and_reappears_after_restart(kafka_notifications):
-    producer = kafka_notifications.publisher.producer
-    producer.produce(kafka_notifications.publisher.topic, key=b"appt_bad", value=b"{}")
+    value = connection.execute("SELECT payload FROM outbox").fetchone()["payload"]
+    key = event["appointment_id"].encode()
+    if invalid == "json":
+        value = {}
+    elif invalid == "key":
+        key = b"wrong"
+    else:
+        value["patient_id"] = "wrong"
+    producer = kafka.publisher.producer
+    producer.produce(kafka.topic, key=key, value=json.dumps(value).encode())
     assert producer.flush(6) == 0
-    consumer = kafka_notifications.consumer()
-    record = read_record(consumer)
+    group = f"invalid-{uuid4().hex}"
+    consumer = kafka.consumer(group)
+    record = kafka.read(consumer)
     with pytest.raises(ValueError):
-        worker.process_record(consumer, record)
-    assert committed_offset(consumer, record) == OFFSET_INVALID
-    consumer = kafka_notifications.restart(consumer)
-    retry = read_record(consumer)
+        worker.process_record(consumer, record, notifications.process_event)
+    assert kafka.offset(consumer, record) == OFFSET_INVALID
+    kafka.close(consumer)
+    consumer = kafka.consumer(group)
+    retry = kafka.read(consumer)
     assert (retry.partition(), retry.offset()) == (record.partition(), record.offset())
+    assert connection.execute("SELECT count(*) FROM notifications").fetchone()["count"] == 0
 
 
-def test_phase2_migration_preserves_events_without_sending_historical_notices(
-    client, event, connection
-):
+def test_phase2_migration_preserves_events_without_sending_historical_notices(client, event, connection):
     original = client.post("/events", json=event)
-    assert original.status_code == 201
     connection.execute("DROP TABLE notifications, mock_provider_acceptances")
     connection.execute("ALTER TABLE events DROP COLUMN notification_type")
     migrate(connection)
     assert client.post("/events", json=event).content == original.content
     assert connection.execute("SELECT notification_type FROM events").fetchone()["notification_type"] is None
     assert connection.execute("SELECT count(*) FROM notifications").fetchone()["count"] == 0
+
+
+def test_offset_commit_errors_retry_durable_processing_safely(
+    client, event, connection, kafka, monkeypatch
+):
+    assert client.post("/events", json=event).status_code == 201
+    assert publish_one(connection, kafka.publisher)
+    consumer = kafka.consumer()
+    record = kafka.read(consumer)
+    calls = []
+
+    class UnreliableCommit:
+        def commit(self, **kwargs):
+            calls.append(kwargs)
+            assert connection.execute("SELECT count(*) FROM analytics_events").fetchone()["count"] == 1
+            if len(calls) == 1:
+                raise KafkaException("injected commit failure")
+            if len(calls) == 2:
+                from confluent_kafka import KafkaError
+                from types import SimpleNamespace
+                return [SimpleNamespace(error=KafkaError(KafkaError._TRANSPORT))]
+            return consumer.commit(**kwargs)
+
+    monkeypatch.setattr(worker, "sleep", lambda seconds: None)
+    worker.process_record(UnreliableCommit(), record, analytics.process_event)
+    assert len(calls) == 3
+    assert kafka.offset(consumer, record) == record.offset() + 1
+    assert connection.execute("SELECT count(*) FROM analytics_events").fetchone()["count"] == 1

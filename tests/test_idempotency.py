@@ -136,6 +136,7 @@ def test_duplicate_waits_for_commit_then_rolls_back_before_replay(
     assert response.status_code == (409 if different_payload else 201)
     events, appointments = snapshot(connection)
     assert len(events) == len(appointments) == 1
+    assert connection.execute("SELECT count(*) FROM outbox").fetchone()["count"] == 1
     assert events == [original]
     assert appointments[0]["appointment_id"] == event["appointment_id"]
     if different_payload:

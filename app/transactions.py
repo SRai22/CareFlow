@@ -16,7 +16,7 @@ def _insert_event(
         "received_at"
     ]
     outcome = EventRead(**event.model_dump(), received_at=received_at).model_dump(mode="json")
-    return connection.execute(
+    stored = connection.execute(
         """
         INSERT INTO events (
             event_id, patient_id, appointment_id,
@@ -36,6 +36,14 @@ def _insert_event(
             "notification_type": notification_type,
         },
     ).fetchone()
+    connection.execute(
+        """
+        INSERT INTO outbox (event_id, appointment_id, payload)
+        VALUES (%s, %s, %s)
+        """,
+        (event.event_id, event.appointment_id, Jsonb(event.model_dump(mode="json"))),
+    )
+    return stored
 
 
 def schedule_appointment(

@@ -10,7 +10,6 @@ from psycopg.conninfo import make_conninfo
 from psycopg.rows import dict_row
 
 from app.main import app
-from app.kafka import get_publisher
 
 
 class RecordingPublisher:
@@ -37,7 +36,7 @@ def database_url(monkeypatch):
         test_url = make_conninfo(url, options=f"-csearch_path={schema}")
         try:
             with psycopg.connect(test_url) as connection:
-                for filename in ("schema.sql", "notification_schema.sql"):
+                for filename in ("schema.sql", "notification_schema.sql", "messaging_schema.sql"):
                     connection.execute(
                         (Path(__file__).parents[1] / "app" / filename).read_text()
                     )
@@ -57,13 +56,9 @@ def connection(database_url):
 
 
 @pytest.fixture
-def client(database_url, publisher):
-    app.dependency_overrides[get_publisher] = lambda: publisher
-    try:
-        with TestClient(app, raise_server_exceptions=False) as test_client:
-            yield test_client
-    finally:
-        app.dependency_overrides.pop(get_publisher, None)
+def client(database_url):
+    with TestClient(app, raise_server_exceptions=False) as test_client:
+        yield test_client
 
 
 @pytest.fixture
@@ -76,3 +71,70 @@ def event():
         "event_version": 1,
         "occurred_at": "2026-10-17T10:00:00Z",
     }
+
+
+@pytest.fixture
+def kafka():
+    from time import monotonic
+    from types import SimpleNamespace
+
+    from confluent_kafka import Consumer, TopicPartition
+    from confluent_kafka.admin import AdminClient, NewTopic
+
+    from app.kafka import TOPIC
+    from app.kafka_producer import KafkaPublisher
+    from app.worker import create_consumer
+
+    servers = os.environ.get("TEST_KAFKA_BOOTSTRAP_SERVERS")
+    if not servers:
+        pytest.skip("Set TEST_KAFKA_BOOTSTRAP_SERVERS to run real Kafka tests")
+    admin = AdminClient({"bootstrap.servers": servers})
+    topic = f"careflow-test-{uuid4().hex}"
+    admin.create_topics([NewTopic(topic, num_partitions=3, replication_factor=1)])[topic].result(15)
+    consumers = []
+
+    def consumer(group=None):
+        result = create_consumer(servers, group_id=group or f"test-{uuid4().hex}", topic=topic)
+        consumers.append(result)
+        return result
+
+    def reader():
+        result = Consumer({
+            "bootstrap.servers": servers,
+            "group.id": f"reader-{uuid4().hex}",
+            "enable.auto.commit": False,
+        })
+        result.assign([TopicPartition(topic, partition, 0) for partition in range(3)])
+        consumers.append(result)
+        return result
+
+    def close(result):
+        result.close()
+        consumers.remove(result)
+
+    def read(result):
+        deadline = monotonic() + 15
+        while monotonic() < deadline:
+            record = result.poll(0.2)
+            if record is not None:
+                assert record.error() is None
+                return record
+        pytest.fail("Kafka consumer did not receive a record")
+
+    def offset(result, record):
+        position = result.committed([TopicPartition(topic, record.partition())], timeout=5)[0]
+        assert position.error is None
+        return position.offset
+
+    try:
+        metadata = admin.list_topics(TOPIC, timeout=10).topics[TOPIC]
+        assert metadata.error is None
+        assert len(metadata.partitions) == 3
+        yield SimpleNamespace(
+            publisher=KafkaPublisher(servers, topic=topic), consumer=consumer,
+            reader=reader, close=close, read=read, offset=offset, topic=topic,
+        )
+    finally:
+        for result in consumers:
+            result.close()
+        admin.delete_topics([topic])[topic].result(15)
