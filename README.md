@@ -217,6 +217,84 @@ and unexpected errors stop immediately. Closing the consumer does not commit.
 Repair the cause and restart using the same group; pending records replay.
 There is no dead-letter queue, provider sender or process supervisor yet.
 
+## Consumer crash/restart harness
+
+The recovery harness uses the real consumer handlers and forcibly exits its own
+process at one selected checkpoint. `os._exit(86)` bypasses normal exception
+handling and consumer cleanup, so this exercises an abrupt crash rather than a
+graceful close. Normal consumers never enable these checkpoints.
+
+Assuming a new event that warrants work and no earlier committed group offset:
+
+| `--crash-at` | Durable work at crash | Committed offset at crash | Restart with the same group |
+| --- | --- | --- | --- |
+| `before_processing` | No work from this attempt | Unset | Read the same record and persist work |
+| `after_persist` | One committed outcome | Unset | Read the same record; deduplication preserves the existing outcome |
+| `after_commit` | One committed outcome | Record offset + 1 | Continue at the next record |
+
+For a group with earlier progress, the first two cases leave its previous offset
+unchanged. On replay, the handler validates the event identity and inserts with
+`ON CONFLICT DO NOTHING`, then commits the offset after its transaction completes.
+The unique deduplication identity and all work it represents must commit in the
+same PostgreSQL transaction. A failure before commit must roll back all of that
+work. Otherwise, an existing deduplication marker could hide unfinished work.
+This guarantee covers the database intents/activity recorded here; external
+notification delivery would require its own retry/idempotency contract.
+
+With the same environment variables as the API, run:
+
+```bash
+python -m app.failure_injection --consumer notifications \
+  --group-id careflow-chaos-notifications --crash-at after_persist
+# Expected exit code: 86. Restart without --crash-at using the same group:
+python -m app.failure_injection --consumer notifications \
+  --group-id careflow-chaos-notifications
+```
+
+Inspect committed offsets and notification work separately:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:29092 --describe --group careflow-chaos-notifications
+docker compose exec db psql -U careflow -d careflow -c 'TABLE notifications;'
+```
+
+Use `--consumer analytics` for the other handler. The harness prints a JSON
+report containing the checkpoint, topic, partition and record offset. Without
+`--crash-at`, it processes one record and exits successfully. `--topic` selects a
+test topic; the default is `appointments.events`. Use a dedicated group so the
+exercise does not advance either application's normal consumer group. New groups
+start at the earliest available record, which may already have database work
+from another group. Existing outcomes are preserved.
+
+The harness uses a six-second consumer session timeout to shorten local failure
+detection. Normal workers keep the client's 45-second default. A restart may
+wait for the broker to detect the dead member and rebalance.
+[Confluent consumer configuration](https://docs.confluent.io/platform/current/clients/librdkafka/html/md_CONFIGURATION.html)
+The default record wait is 30 seconds; `--timeout` changes it. Waiting with no
+record exits with code 1 and commits no offset. After `after_commit`, this is
+expected if no later event exists; publish another event to observe forward
+progress.
+
+Run the automated recovery matrix with both test environment variables set:
+
+```bash
+pytest -q tests/test_failure_recovery.py
+```
+
+It crashes and restarts real subprocesses at all three points for both consumers,
+using isolated PostgreSQL schemas, Kafka topics and groups. An independent
+connection inspects durable work and broker-committed offsets after each crash.
+A second event with the same appointment key proves whether restart replays the
+first record or moves forward. Offset inspection uses an unsubscribed consumer
+so observing progress does not join or rebalance the group. Tests also verify
+that replay preserves the original outcome/timestamp, that uncommitted writes
+roll back, and that no provider is called.
+
+Broker outage injection, a DLQ policy, lag measurement and multi-consumer
+assignment tests remain the next recovery exercises. Poison records still stop
+the current worker under the existing explicit error policy.
+
 ## Tables
 
 See [app/schema.sql](app/schema.sql),

@@ -98,14 +98,19 @@ def kafka():
         consumers.append(result)
         return result
 
-    def reader():
+    def observer(group):
+        # Offset inspection must not subscribe and hold up the group's rebalance.
         result = Consumer({
             "bootstrap.servers": servers,
-            "group.id": f"reader-{uuid4().hex}",
+            "group.id": group,
             "enable.auto.commit": False,
         })
-        result.assign([TopicPartition(topic, partition, 0) for partition in range(3)])
         consumers.append(result)
+        return result
+
+    def reader():
+        result = observer(f"reader-{uuid4().hex}")
+        result.assign([TopicPartition(topic, partition, 0) for partition in range(3)])
         return result
 
     def close(result):
@@ -132,7 +137,7 @@ def kafka():
         assert len(metadata.partitions) == 3
         yield SimpleNamespace(
             publisher=KafkaPublisher(servers, topic=topic), consumer=consumer,
-            reader=reader, close=close, read=read, offset=offset, topic=topic,
+            reader=reader, observer=observer, close=close, read=read, offset=offset, topic=topic,
         )
     finally:
         for result in consumers:
