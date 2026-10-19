@@ -312,3 +312,230 @@ def test_inflight_milestone41_input_still_replays(temporal_settings):
         finally:
             await clean_up(handle)
     asyncio.run(asyncio.wait_for(scenario(), timeout=30))
+
+
+def test_cancellation_handoff_is_durable_before_offset_and_suppresses_on_worker_start(
+    client, reminder_event, connection, kafka, handoff_settings, monkeypatch
+):
+    assert client.post("/events", json=reminder_event).status_code == 201
+    assert publish_one(connection, kafka.publisher)
+    group = f"cancel-{uuid4().hex}"
+    consumer = kafka.consumer(group)
+    scheduled = kafka.read(consumer)
+    worker.process_record(consumer, scheduled, reminders.process_event)
+    cancelled = {**reminder_event, "event_id": "evt_cancel", "event_type": "APPOINTMENT_CANCELLED"}
+    assert client.post("/events", json=cancelled).status_code == 201
+    assert publish_one(connection, kafka.publisher)
+    record = kafka.read(consumer)
+    with monkeypatch.context() as patch:
+        patch.setenv("TEMPORAL_ADDRESS", "127.0.0.1:1")
+        patch.setattr(reminders, "HANDOFF_TIMEOUT_SECONDS", 0.2)
+        patch.setattr(worker, "sleep", lambda seconds: None)
+        with pytest.raises(TemporalHandoffError):
+            worker.process_record(consumer, record, reminders.process_event)
+    assert kafka.offset(consumer, record) == record.offset()
+    assert connection.execute("SELECT 1 FROM reminder_handoffs WHERE event_id = 'evt_cancel'").fetchone() is None
+
+    def crash(point, message):
+        if point == "after_persist":
+            raise RuntimeError("Crash after signal acknowledgment")
+    with pytest.raises(RuntimeError, match="after signal"):
+        worker.process_record(consumer, record, reminders.process_event, checkpoint=crash)
+    receipt = connection.execute("SELECT outcome FROM reminder_handoffs WHERE event_id = 'evt_cancel'").fetchone()
+    assert receipt["outcome"]["cancellation"] == "SIGNALLED"
+    assert kafka.offset(consumer, record) == record.offset()
+    kafka.close(consumer)
+    restarted = kafka.consumer(group)
+    replay = kafka.read(restarted)
+    assert replay.offset() == record.offset()
+    worker.process_record(restarted, replay, reminders.process_event)
+    assert kafka.offset(restarted, replay) == replay.offset() + 1
+
+    async def scenario():
+        settings, queue = handoff_settings
+        temporal = await Client.connect(settings[0], namespace=settings[1])
+        handle = temporal.get_workflow_handle(workflow_id(reminder_event["appointment_id"]))
+        try:
+            history = await handle.fetch_history()
+            assert any(e.event_type == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED for e in history.events)
+            # Signal survives until a fresh worker actually polls this queue.
+            async with worker_process(settings, queue):
+                assert (await handle.result())["status"] == "CANCELLED"
+            assert connection.execute("SELECT count(*) FROM mock_provider_acceptances").fetchone()["count"] == 0
+        finally:
+            await clean_up(handle)
+    asyncio.run(asyncio.wait_for(scenario(), 45))
+
+
+def test_reschedule_signals_old_generation_and_delivers_only_new_generation(
+    client, reminder_event, connection, kafka, handoff_settings
+):
+    assert client.post("/events", json=reminder_event).status_code == 201
+    assert publish_one(connection, kafka.publisher)
+    consumer = kafka.consumer()
+    worker.process_record(consumer, kafka.read(consumer), reminders.process_event)
+    rescheduled = {**reminder_event, "event_id": "evt_reschedule", "event_type": "APPOINTMENT_RESCHEDULED", "scheduled_for": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()}
+    assert client.post("/events", json=rescheduled).status_code == 201
+    assert publish_one(connection, kafka.publisher)
+    worker.process_record(consumer, kafka.read(consumer), reminders.process_event)
+
+    async def scenario():
+        settings, queue = handoff_settings
+        temporal = await Client.connect(settings[0], namespace=settings[1])
+        old = temporal.get_workflow_handle(workflow_id(reminder_event["appointment_id"], 1))
+        new = temporal.get_workflow_handle(workflow_id(reminder_event["appointment_id"], 2))
+        try:
+            async with worker_process(settings, queue):
+                assert (await old.result())["status"] == "CANCELLED"
+                result = await new.result()
+                assert result["status"] == "SENT" and result["schedule_generation"] == 2
+            rows = connection.execute("SELECT * FROM notification_deliveries").fetchall()
+            assert len(rows) == 1 and rows[0]["schedule_generation"] == 2
+            assert connection.execute("SELECT count(*) FROM mock_provider_acceptances").fetchone()["count"] == 1
+        finally:
+            await clean_up(old)
+            await clean_up(new)
+    asyncio.run(asyncio.wait_for(scenario(), 45))
+
+
+def test_activity_retry_after_provider_timeout_and_cancel_after_completed_workflow(
+    client, reminder_event, connection, kafka, handoff_settings, monkeypatch
+):
+    event = {**reminder_event, "scheduled_for": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()}
+    assert client.post("/events", json=event).status_code == 201
+    assert publish_one(connection, kafka.publisher)
+    consumer = kafka.consumer()
+    worker.process_record(consumer, kafka.read(consumer), reminders.process_event)
+    monkeypatch.setenv("MOCK_PROVIDER_TIMEOUT_AFTER_ACCEPT_ONCE", "1")
+
+    async def scenario():
+        settings, queue = handoff_settings
+        temporal = await Client.connect(settings[0], namespace=settings[1])
+        handle = temporal.get_workflow_handle(workflow_id(event["appointment_id"]))
+        try:
+            async with worker_process(settings, queue):
+                result = await handle.result()
+                assert result["status"] == "SENT"
+            row = connection.execute("SELECT * FROM notification_deliveries").fetchone()
+            assert row["attempt_count"] == 2
+            assert connection.execute("SELECT count(*) FROM mock_provider_acceptances").fetchone()["count"] == 1
+            cancelled = {**event, "event_id": "evt_cancel", "event_type": "APPOINTMENT_CANCELLED"}
+            assert client.post("/events", json=cancelled).status_code == 201
+            assert publish_one(connection, kafka.publisher)
+            record = kafka.read(consumer)
+            await asyncio.to_thread(worker.process_record, consumer, record, reminders.process_event)
+            assert kafka.offset(consumer, record) == record.offset() + 1
+            receipt = connection.execute("SELECT outcome FROM reminder_handoffs WHERE event_id = 'evt_cancel'").fetchone()
+            assert receipt["outcome"]["cancellation"] == "ALREADY_CLOSED"
+            row = connection.execute("SELECT * FROM notification_deliveries").fetchone()
+            assert row["status"] == "SENT" and row["invalidated_at"] is not None
+        finally:
+            await clean_up(handle)
+    asyncio.run(asyncio.wait_for(scenario(), 45))
+
+
+def test_cancellation_during_activity_does_not_retract_claimed_dispatch(
+    client, reminder_event, connection, kafka, handoff_settings, monkeypatch
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from temporalio.worker import Worker
+    from app import mock_provider, reminder_delivery
+    entered, release = Event(), Event()
+    send = mock_provider.send_payload
+    def blocked_send(key, payload):
+        entered.set()
+        assert release.wait(timeout=15), "Test did not release provider request"
+        return send(key, payload)
+    monkeypatch.setattr(mock_provider, "send_payload", blocked_send)
+    event = {**reminder_event, "scheduled_for": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()}
+    assert client.post("/events", json=event).status_code == 201
+    assert publish_one(connection, kafka.publisher)
+    consumer = kafka.consumer()
+    worker.process_record(consumer, kafka.read(consumer), reminders.process_event)
+
+    async def scenario():
+        settings, queue = handoff_settings
+        temporal = await Client.connect(settings[0], namespace=settings[1])
+        handle = temporal.get_workflow_handle(workflow_id(event["appointment_id"]))
+        try:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                async with Worker(
+                    temporal, task_queue=queue, workflows=[AppointmentReminderWorkflow],
+                    activities=[reminder_delivery.deliver_reminder, reminder_delivery.finish_uncertain_delivery],
+                    activity_executor=executor,
+                ):
+                    try:
+                        assert await asyncio.to_thread(entered.wait, 10)
+                        cancelled = {**event, "event_id": "evt_cancel", "event_type": "APPOINTMENT_CANCELLED"}
+                        assert client.post("/events", json=cancelled).status_code == 201
+                        assert publish_one(connection, kafka.publisher)
+                        record = kafka.read(consumer)
+                        await asyncio.to_thread(worker.process_record, consumer, record, reminders.process_event)
+                        assert kafka.offset(consumer, record) == record.offset() + 1
+                        assert connection.execute("SELECT outcome FROM reminder_handoffs WHERE event_id = 'evt_cancel'").fetchone()["outcome"]["cancellation"] == "SIGNALLED"
+                    finally:
+                        release.set()
+                    result = await handle.result()
+                    assert result["status"] == "SENT" and result["invalidated_after_claim"]
+            assert connection.execute("SELECT count(*) FROM mock_provider_acceptances").fetchone()["count"] == 1
+        finally:
+            release.set()
+            await clean_up(handle)
+    asyncio.run(asyncio.wait_for(scenario(), 45))
+
+
+def test_activity_retry_budget_exhaustion_records_uncertain_outcome(
+    client, reminder_event, connection, kafka, handoff_settings, monkeypatch
+):
+    event = {**reminder_event, "scheduled_for": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()}
+    assert client.post("/events", json=event).status_code == 201
+    assert publish_one(connection, kafka.publisher)
+    consumer = kafka.consumer()
+    worker.process_record(consumer, kafka.read(consumer), reminders.process_event)
+    monkeypatch.setenv("MOCK_PROVIDER_FAIL_BEFORE_ACCEPT", "1")
+
+    async def scenario():
+        settings, queue = handoff_settings
+        temporal = await Client.connect(settings[0], namespace=settings[1])
+        handle = temporal.get_workflow_handle(workflow_id(event["appointment_id"]))
+        try:
+            async with worker_process(settings, queue):
+                assert (await handle.result())["status"] == "UNCERTAIN"
+            row = connection.execute("SELECT * FROM notification_deliveries").fetchone()
+            assert row["attempt_count"] == 5 and row["status"] == "UNCERTAIN"
+            assert "unavailability" in row["last_error"]
+            assert connection.execute("SELECT status FROM notifications WHERE notification_type = 'APPOINTMENT_REMINDER'").fetchone()["status"] == "UNKNOWN"
+            assert connection.execute("SELECT count(*) FROM mock_provider_acceptances").fetchone()["count"] == 0
+        finally:
+            await clean_up(handle)
+    asyncio.run(asyncio.wait_for(scenario(), 45))
+
+
+def test_generation_timer_survives_worker_kill_and_then_delivers(
+    client, reminder_event, connection, kafka, handoff_settings
+):
+    event = {**reminder_event, "scheduled_for": (datetime.now(timezone.utc) + timedelta(hours=24, seconds=4)).isoformat()}
+    assert client.post("/events", json=event).status_code == 201
+    assert publish_one(connection, kafka.publisher)
+    consumer = kafka.consumer()
+    worker.process_record(consumer, kafka.read(consumer), reminders.process_event)
+
+    async def scenario():
+        settings, queue = handoff_settings
+        temporal = await Client.connect(settings[0], namespace=settings[1])
+        handle = temporal.get_workflow_handle(workflow_id(event["appointment_id"]))
+        original_run = (await handle.describe()).run_id
+        try:
+            async with worker_process(settings, queue) as process:
+                await wait_for_event(handle, EventType.EVENT_TYPE_TIMER_STARTED)
+                process.kill()
+                await process.wait()
+            await wait_for_event(handle, EventType.EVENT_TYPE_TIMER_FIRED)
+            async with worker_process(settings, queue):
+                assert (await handle.result())["status"] == "SENT"
+            assert (await handle.describe()).run_id == original_run
+            assert connection.execute("SELECT count(*) FROM mock_provider_acceptances").fetchone()["count"] == 1
+        finally:
+            await clean_up(handle)
+    asyncio.run(asyncio.wait_for(scenario(), 60))

@@ -37,7 +37,7 @@ def database_url(monkeypatch):
         test_url = make_conninfo(url, options=f"-csearch_path={schema}")
         try:
             with psycopg.connect(test_url) as connection:
-                for filename in ("schema.sql", "notification_schema.sql", "messaging_schema.sql"):
+                for filename in ("schema.sql", "notification_schema.sql", "messaging_schema.sql", "reminder_schema.sql"):
                     connection.execute(
                         (Path(__file__).parents[1] / "app" / filename).read_text()
                     )

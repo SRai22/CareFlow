@@ -21,6 +21,7 @@ def test_schedule_persists_event_and_appointment(client, event):
         "last_event_id": "evt_001",
         "updated_at": appointment.json()["updated_at"],
         "scheduled_for": event["scheduled_for"],
+        "schedule_generation": 1,
     }
 
 

@@ -158,7 +158,7 @@ def test_invalid_record_never_commits_and_reappears_after_restart(
 
 def test_phase2_migration_preserves_events_without_sending_historical_notices(client, event, connection):
     original = client.post("/events", json=event)
-    connection.execute("DROP TABLE notifications, mock_provider_acceptances")
+    connection.execute("DROP TABLE notification_deliveries, notifications, mock_provider_acceptances")
     connection.execute("ALTER TABLE events DROP COLUMN notification_type")
     migrate(connection)
     assert client.post("/events", json=event).content == original.content

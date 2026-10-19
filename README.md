@@ -2,11 +2,12 @@
 
 CareFlow receives appointment events, updates PostgreSQL state, and delivers
 committed events through a transactional outbox to Kafka. Independent consumers
-persist notification intents and analytics activity. This milestone sends no SMS
-and calls no notification provider.
+persist notification intents and analytics activity. Temporal reminder activities
+call a durable local fake provider; no real SMS is sent.
 
-Milestone 4.2 hands scheduled events from Kafka to Temporal. One workflow per
-appointment becomes `REMINDER_DUE` at `scheduled_for - 24 hours`; it sends no SMS.
+Milestones 4.3–4.4 add cancellation signals, schedule generations, and retryable
+reminder delivery. A generation waits until `scheduled_for - 24 hours`, then a
+PostgreSQL dispatch claim authorizes one logical provider request.
 
 ```text
 POST /events → PostgreSQL transaction [event + appointment + outbox] → 201
@@ -16,7 +17,7 @@ POST /events → PostgreSQL transaction [event + appointment + outbox] → 201
                        appointments.events (3 partitions)
              ├─ careflow-notifications → notification intents
              ├─ careflow-analytics → event activity
-             └─ careflow-reminders → Temporal timer → REMINDER_DUE
+             └─ careflow-reminders → Temporal timer/signal → dispatch claim → fake provider
 ```
 
 Python 3.12+ and Docker Compose are required. PostgreSQL, Kafka and Temporal run
@@ -58,7 +59,18 @@ For an existing Milestone 4.1 database, stop the API and workers, then run once:
 python -m app.migrate_scheduled_for
 ```
 
-Restart the API and workers using the updated code. This additive migration adds
+For an existing Milestone 4.2 database, stop the API and workers and run once:
+
+```bash
+python -m app.migrate_reminder_delivery
+```
+
+This migration adds schedule generations, related delivery records and durable
+Kafka handoff receipts. Existing notification outcomes, request hashes and
+outbox payloads are preserved. Existing appointments start at generation 1;
+legacy event generation remains null to identify the earlier timer-only protocol.
+
+Restart the API and workers using the updated code. The appointment-time migration adds
 nullable `scheduled_for TIMESTAMPTZ` columns to appointments and events. Existing
 rows remain readable, with unknown times left null. Existing request hashes,
 stored HTTP responses and outbox payloads are preserved. Historical events are
@@ -66,7 +78,7 @@ not assigned invented times or automatically enqueued for reminders.
 
 If upgrading from an earlier schema, apply the missing migrations in order:
 `app.migrate_idempotency`, `app.migrate_phase2`, `app.migrate_outbox`, then
-`app.migrate_scheduled_for`.
+`app.migrate_scheduled_for`, then `app.migrate_reminder_delivery`.
 Do not run a migration already applied. `migrate_idempotency` backfills request
 hashes and successful responses; `migrate_phase2` adds persisted notification
 decisions and the notification/provider tables. Historical notification decisions
@@ -87,7 +99,9 @@ python -m app.temporal_worker
 Run **one outbox publisher instance** for this milestone. `python -m app.worker`
 is also an entry point for the intent-only notification consumer; it no longer
 calls the mock provider. The earlier provider exercise remains in
-`app/notifications.py` and `app/mock_provider.py`, but the current consumers do not use it.
+`app/notifications.py` and `app/mock_provider.py`. The shared fake provider is now
+also used by Temporal reminder activities; the Kafka notification consumer still
+records confirmation/cancellation intents only.
 
 Compose runs a single Kafka broker in KRaft mode, without ZooKeeper. The topic
 initializer creates `appointments.events` with three partitions and replication
@@ -141,10 +155,16 @@ scheduling transaction enforces the business requirement before commit.
 Each accepted event inserts its request fingerprint, stored successful HTTP
 response, notification decision and immutable outbox payload in the same
 transaction as the appointment change. The payload is a snapshot of the validated
-request, including `scheduled_for` when supplied; publication never rebuilds it
-from current state.
+request, including `scheduled_for` when supplied, plus server-owned
+`schedule_generation`. Publication never rebuilds it from current state.
 
 Scheduling inserts a new `SCHEDULED` appointment; an existing appointment conflicts.
+`APPOINTMENT_RESCHEDULED` requires a future time and a matching active appointment;
+it updates the time and increments `schedule_generation` under a row lock. It
+returns `404` for no appointment/patient match and `409` for a cancelled
+appointment. Retries of the same event do not increment the generation again.
+The generation is server-owned; clients cannot supply it in POST payloads.
+
 Cancellation locks an existing appointment matching both appointment and patient
 IDs, then updates status, `last_event_id` and `updated_at`. No match raises
 `LookupError` and rolls back the event and outbox. Matching patient IDs enforces
@@ -153,7 +173,8 @@ writes in that transaction.
 
 Distinct repeated cancellations are accepted and each gets an event and outbox
 row. Only a transition from `SCHEDULED` to `CANCELLED` warrants a cancellation
-intent. Scheduling warrants a confirmation intent. These decisions are stored
+intent. Scheduling warrants a confirmation intent. Rescheduling records no new
+confirmation intent; its generation gets a reminder intent when delivery is due. These decisions are stored
 on the event before commit, so a delayed consumer does not infer historical
 transitions from later appointment state.
 
@@ -162,6 +183,8 @@ fingerprints all request fields, including the normalized appointment time.
 Changing the time under the same event ID returns `409`; an equivalent timezone
 representation replays the original outcome. Absent/null optional times are
 omitted from canonical JSON, preserving historical six-field fingerprints.
+Server-owned generation metadata is excluded from request hashing and checked
+separately against the stored event by every consumer.
 The API attempts an insert first; PostgreSQL's
 primary key resolves concurrent requests. Only `UniqueViolation` from
 `events_pkey` triggers replay handling, **after rollback** of the failed
@@ -227,7 +250,7 @@ claim leases and published-row retention are later milestones.
 | --- | --- | --- |
 | `app.consumers.notifications` | `careflow-notifications` | Insert a unique `PENDING` notification intent when the stored business decision warrants one |
 | `app.consumers.analytics` | `careflow-analytics` | Insert one `analytics_events` activity row per accepted event |
-| `app.consumers.reminders` | `careflow-reminders` | Start or verify the matching Temporal reminder workflow before committing the offset |
+| `app.consumers.reminders` | `careflow-reminders` | Start/verify generation workflows, signal cancellation/invalidation, and persist acknowledged handoff receipts before committing offsets |
 
 Separate groups each receive all topic records. Kafka distributes a group's
 partitions among its members. Within each worker, records are processed
@@ -236,8 +259,9 @@ compare its fingerprint with the committed event before writing anything.
 
 The notification primary key `(event_id, notification_type)` and analytics
 primary key `event_id` make repeated deliveries harmless. Existing `SENT` rows
-from the previous exercise are preserved. This milestone only records intents:
-no provider call or transition to `SENT` takes place.
+from the previous exercise are preserved. The Kafka notification consumer records
+intents only. Temporal activities create a related `APPOINTMENT_REMINDER` intent
+and update its outcome after calling the local fake provider.
 
 Both `enable.auto.commit` and `enable.auto.offset.store` are disabled. After the
 handler durably completes its database work or Temporal handoff, the worker synchronously commits
@@ -332,132 +356,180 @@ Broker outage injection, a DLQ policy, lag measurement and multi-consumer
 assignment tests remain the next recovery exercises. Poison records still stop
 the current worker under the existing explicit error policy.
 
-## Appointment reminders with Temporal — Milestone 4.2
+## Reliable reminders — Milestones 4.3 and 4.4
 
-Compose runs the pinned `temporalio/temporal:1.9.1` development server. The gRPC
-endpoint is `localhost:7233`, the Web UI is <http://localhost:8233>, and the
-namespace defaults to `default`. Compose-network clients use `temporal:7233`.
-`--db-filename /home/temporal/temporal.db` writes execution history to the named
-`temporal_data` volume. History survives server/container restart while this
-volume is retained. Temporal's SQLite development store is separate from
-PostgreSQL, which remains the source of truth for appointment business state.
-[Temporal development server](https://github.com/temporalio/documentation/blob/main/docs/cli/setup-cli.mdx)
+Compose runs a persistent Temporal development server at `localhost:7233`, with
+UI at <http://localhost:8233> and namespace `default`. The `temporal_data` volume
+stores its SQLite execution history. PostgreSQL remains the source of truth for
+appointment state and dispatch authorization. `TEMPORAL_ADDRESS`,
+`TEMPORAL_NAMESPACE`, and `TEMPORAL_TASK_QUEUE` configure clients/workers; the
+queue defaults to `careflow-reminders`. Worker and consumer must agree on it.
 
-Run the relay, three consumers and Temporal worker using the commands above.
-The reminder consumer's group `careflow-reminders` receives every appointment
-event independently of notification intents and analytics. A Temporal outage
-pauses this group's progress without blocking the other two groups.
+### Schedule generations and cancellation
 
-For each scheduled event with a time, the reminder consumer:
+Scheduling creates generation 1. `APPOINTMENT_RESCHEDULED` changes the appointment
+time and increments the generation atomically with its event/outbox writes.
+Rescheduling a cancelled appointment is rejected; it does not implicitly reopen
+it. Concurrent changes serialize on the appointment row. The API returns the
+current generation on `GET /appointments/{id}`.
 
-1. Checks that the key and immutable request match a committed PostgreSQL event.
-2. Requests `AppointmentReminderWorkflow` with ID
-   `appointment-reminder:{appointment_id}` on task queue `careflow-reminders`.
-3. Waits for Temporal's durable start acknowledgment before committing the Kafka
-   offset. It does not wait for the workflow's timer to fire.
+Workflow IDs are `appointment-reminder:{appointment_id}` for generation 1 and
+`appointment-reminder:{appointment_id}:g{generation}` for later generations.
+Delivery identity and provider keys also include the generation. A stale,
+unclaimed generation cannot dispatch after rescheduling, even if its Kafka
+signal is delayed, its old workflow wakes up, or events are replayed out of order.
 
-`WorkflowIDConflictPolicy.FAIL` and `WorkflowIDReusePolicy.REJECT_DUPLICATE`
-protect running and retained completed executions. On `WorkflowAlreadyStartedError`,
-the consumer fetches the existing run and verifies workflow type, task queue,
-appointment ID, scheduled time, and running/completed status. Matching duplicates
-are acknowledged. Different arguments, a legacy demo with the same ID, or a
-failed/terminated/cancelled run stop processing without committing the offset.
-A raw duplicate CLI start still exits with code 1; the Kafka handoff explicitly
-implements confirmation of an existing desired workflow.
-[Temporal Python client API](https://python.temporal.io/temporalio.client.Client.html#start_workflow)
+The reminder Kafka consumer uses committed event metadata to identify which
+generation to affect. On rescheduling, it signals the previous generation and
+starts/verifies the new one. On cancellation, it ensures the matching generation
+exists and sends its idempotent `cancel` signal. Creating it first also handles a
+cancellation arriving before its scheduling handoff; the final PostgreSQL state
+check suppresses delivery if that workflow wakes before the signal is processed.
 
-A crash after Temporal accepts a start but before the Kafka commit replays the
-record. The next consumer confirms the existing run instead of creating another.
-A handoff has a ten-second deadline. Transient errors get the shared three-attempt
-retry policy; on exhaustion the worker exits without advancing offsets. Restore
-Temporal and restart the consumer with the same group. There is no distributed
-transaction or transaction held open during the network call.
+The workflow's signal handler sets a cancellation flag. Its deterministic
+`workflow.wait_condition(..., timeout=remaining_delay)` waits for either that
+flag or the reminder deadline. Cancellation while waiting returns `CANCELLED`
+without attempting delivery. At the deadline it executes a delivery activity;
+all database and provider calls are outside workflow code.
+[Temporal signals](https://docs.temporal.io/develop/python/workflows/message-passing)
 
-Workflow-ID deduplication is bounded by Temporal's history retention. Replays
-after history is removed need a longer-lived deduplication policy before any real
-provider delivery is introduced. There is no permanent exactly-once claim here.
+**Kafka cancellation offsets advance only after the signal is accepted by
+Temporal**, not merely queued locally. `reminder_handoffs` records the durable
+acknowledgment before the offset commit. A crash after acknowledgment but before
+the receipt causes a harmless repeated signal. A crash after the receipt but
+before the offset commit can recover from that receipt without another network
+call. Invalid payloads still fail identity/generation verification before replay.
 
-[app/workflows/appointment_reminder.py](app/workflows/appointment_reminder.py)
-computes `scheduled_for - timedelta(hours=24)` using timezone-aware timestamps.
-It calculates the remaining delay from deterministic `workflow.now()`, waits
-using `workflow.sleep()`, then returns:
+Signals cannot be sent to a closed execution. After verifying its type, inputs,
+queue and terminal state, the consumer records `ALREADY_CLOSED` and acknowledges
+that cancellation event. It does not reopen an execution or retract a delivery.
+This is an explicit exception to signaling a running workflow, with a durable
+receipt. Provider state and `notification_deliveries` remain available for audit.
+Temporal failure holds the Kafka offset, with the existing bounded retry/stop
+policy. PostgreSQL cancellation takes effect even while Temporal is unavailable.
 
-```json
-{"appointment_id": "appt_123", "status": "REMINDER_DUE"}
-```
+### Dispatch cutoff and delivery state
 
-If the reminder time has already passed, the workflow returns immediately without
-creating a timer. The workflow performs no database queries or network calls.
-Temporal records pending timers in execution history, so a worker crash loses
-only its local process, not the wait. After replay, the new worker continues the
-same run. Timers can fire while workers are down; a worker must return to process
-the next workflow task and complete execution.
-[Temporal durable timers](https://docs.temporal.io/develop/python/workflows/timers)
+`notification_deliveries` extends an existing `notifications` intent through a
+foreign key on `(event_id, notification_type)`. Its unique logical identity is
+`(appointment_id, schedule_generation, APPOINTMENT_REMINDER)`. It stores the
+immutable provider payload, stable key, claim/attempt timestamps, attempt count,
+last error, invalidation time/reason, provider message ID, and outcome.
 
-Use `TEMPORAL_ADDRESS` and `TEMPORAL_NAMESPACE` to select the server. Both the
-consumer and worker use `TEMPORAL_TASK_QUEUE`, defaulting to `careflow-reminders`;
-they must agree. Worker/starter `--task-queue` overrides this for an isolated demo.
-For a standalone reminder due approximately 30 seconds from now:
+The activity locks the appointment, validates its committed scheduling event,
+and creates the related intent/delivery row. For a new dispatch it checks that
+the appointment is still `SCHEDULED`, its generation/time match, and the reminder
+is due. It then commits `DISPATCHING` with `claimed_at` before releasing the lock
+and contacting the provider. Cancellation and rescheduling take the same lock,
+so transaction commit order defines the cutoff.
+
+| Ordering | Outcome |
+| --- | --- |
+| Cancellation commits before the dispatch claim | No provider request; the activity records `SUPPRESSED` if invoked |
+| Rescheduling commits before an old generation claims | Old attempt is `SUPPRESSED`; the new generation has its own timer/key |
+| Dispatch claim commits first | That logical request remains authorized and may complete/retry, even after cancellation or rescheduling |
+| Provider accepted, response was lost | Retry uses the same key and obtains the same provider message ID |
+| Cancellation arrives after successful workflow completion | Record `ALREADY_CLOSED`; delivery remains `SENT` |
+
+**This guarantees no new logical dispatch claim after committed cancellation.**
+It does not guarantee zero network requests after cancellation. A worker may
+pause or crash after the claim but before provider I/O; its authorized request
+may be accepted later. The same claim's retries remain authorized so uncertain
+provider acceptance can be resolved safely. Cancellation cannot retract them.
+`invalidated_at` and `invalidation_reason` record cancellation/rescheduling after
+claim; `invalidated_after_claim` in the outcome exposes that race explicitly.
+No database lock or transaction is held during provider I/O.
+
+### Retries, provider idempotency and uncertainty
+
+The fake provider commits accepted keys/payloads/message IDs in a separate
+connection. `appointment-reminder:{appointment_id}:g{generation}` is stable
+across activity retries, worker restarts and workflow runs. The same key and
+payload return the same UUID; different content under that key is rejected.
+Concurrent attempts therefore create one provider acceptance. `SENT` means the
+fake provider accepted the request, not that a patient received an SMS.
+
+The delivery activity has a 15-second start-to-close timeout, two-minute total
+budget, and exponential retry delays starting at one second, doubling to a
+30-second cap, with at most five attempts. The worker limits concurrent
+activities to its four execution threads. Input/identity errors are nonretryable.
+[Temporal retry and timeout handling](https://docs.temporal.io/develop/python/best-practices/error-handling)
+
+If the retry budget expires, a separate retryable finalization activity records
+`UNCERTAIN` and marks its notification intent `UNKNOWN`. It never downgrades a
+known `SENT` result and does not assume that a timed-out request failed. A late
+response from an already-authorized attempt may resolve the database row to
+`SENT` after the workflow returned `UNCERTAIN`; the workflow result describes
+what was known at completion. Uncertain deliveries require investigation rather
+than automatically creating another logical request. If finalization itself
+cannot reach PostgreSQL, the workflow fails and its durable `DISPATCHING` row
+still requires reconciliation; it is not silently acknowledged as success.
+
+For controlled local failures, set these only on the Temporal worker:
 
 ```bash
-CAREFLOW_DEMO_TIME=$(python -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) + timedelta(hours=24, seconds=30)).isoformat())')
-python -m app.start_reminder --appointment-id appt_temporal_demo \
-  --scheduled-for "$CAREFLOW_DEMO_TIME" --wait
+MOCK_PROVIDER_TIMEOUT_AFTER_ACCEPT_ONCE=1 python -m app.temporal_worker
+# Or make every provider request fail before acceptance:
+MOCK_PROVIDER_FAIL_BEFORE_ACCEPT=1 python -m app.temporal_worker
 ```
 
-The starter prints workflow and run IDs after acknowledgment. `--wait` keeps the
-client open for the result; otherwise it exits immediately. A client process is
-not needed for the timer to continue. Use a fresh synthetic appointment ID for
-each demo. While waiting, stop the worker, let the timer expire, then restart the
-worker and inspect the original execution in the UI or CLI:
+The first flag loses the first response for each newly accepted key. Acceptance
+is persisted, so a restarted worker's retry returns the original message ID.
+The second exercises retry exhaustion. Neither flag calls a real SMS service.
+
+### Upgrades and verification
+
+Historical payloads and request fingerprints are not rewritten. Existing
+Milestone 4.1/4.2 demo workflow inputs retain their original, side-effect-free
+command paths for replay compatibility. They do not suddenly send notifications
+on upgrade. Explicitly rescheduling an existing appointment creates a new
+generation using the delivery-enabled protocol. The standalone `start_reminder`
+CLI remains a timing-only demo; only committed scheduling events supply the
+source event identity needed to authorize delivery.
+
+Workflow-ID reuse remains rejected within Temporal retention. Durable delivery
+identity/provider keys and handoff receipts add database deduplication beyond
+that retention window. Rescheduling intentionally creates a new logical reminder;
+an earlier already-claimed reminder can still complete under the cutoff policy.
+
+Inspect the state with:
 
 ```bash
-docker compose exec temporal temporal workflow show \
-  --workflow-id appointment-reminder:appt_temporal_demo
+docker compose exec db psql -U careflow -d careflow -c 'TABLE notification_deliveries;'
+docker compose exec db psql -U careflow -d careflow -c 'TABLE reminder_handoffs;'
+docker compose exec temporal temporal workflow show --workflow-id appointment-reminder:appt_123
 ```
 
-Historical scheduling events without `scheduled_for` still decode and validate
-against their original hashes. The reminder consumer logs and acknowledges them
-without inventing a time or creating a workflow. Existing Milestone 4.1 workflows
-using `delay_seconds` retain their original input/command path, so upgrading the
-worker does not invalidate their replay. New starts use scheduled times.
-
-Rescheduling is still rejected as an existing-appointment conflict. Cancellation
-signals and send/cancel race handling are the next milestone. A `REMINDER_DUE`
-result is a timing outcome, not permission to send: the workflow currently sends
-no notification and does not suppress itself on appointment cancellation.
-
-The acceptance tests use real Kafka, PostgreSQL and Temporal with isolated IDs,
-schemas, topics and task queues. They verify the full HTTP/outbox/Kafka handoff,
-duplicate delivery, an acknowledged start followed by Kafka consumer restart,
-completed workflow reuse protection, confirmation of existing workflow inputs,
-Temporal unavailability holding the offset, immediate due behavior, exact timer
-deadlines, and SIGKILL/restart of the Temporal worker while its timer is pending.
-They also exercise the additive migration and retry after an appointment time
-passes. Pending test workflows are terminated during cleanup.
+Tests cover cancellation before dispatch, an in-flight activity accepting its
+signal while the authorized provider request completes, rescheduling and stale
+attempts, duplicate/concurrent attempts, durable signals before offset commits,
+consumer restart after signal acceptance, already-closed workflows, acceptance
+followed by timeout, five-attempt exhaustion, and worker SIGKILL/restart during
+a generation timer. Migrations preserve existing notification outcomes.
 
 ```bash
-pytest -q tests/test_scheduled_for.py tests/test_temporal.py
+pytest -q tests/test_delivery.py tests/test_temporal.py
 ```
 
-Set all three `TEST_*` server variables shown below for this acceptance suite.
-Temporal-only tests skip when `TEST_TEMPORAL_ADDRESS` is absent; broker-dependent
-tests also require `TEST_KAFKA_BOOTSTRAP_SERVERS`.
+Set all three `TEST_*` server variables shown below for the full suite.
 
 ## Tables
 
 See [app/schema.sql](app/schema.sql),
 [app/notification_schema.sql](app/notification_schema.sql) and
-[app/messaging_schema.sql](app/messaging_schema.sql).
+[app/messaging_schema.sql](app/messaging_schema.sql) and
+[app/reminder_schema.sql](app/reminder_schema.sql).
 
 | Table | Purpose |
 | --- | --- |
 | `events` | Accepted immutable request fields including nullable historical `scheduled_for`, successful responses and notification decisions; primary key `event_id` |
 | `appointments` | Current state and nullable historical `scheduled_for`; primary key `appointment_id` |
 | `outbox` | Immutable publication snapshots and `published_at`; primary key `event_id`, partial pending index on `(created_at, event_id)` |
-| `notifications` | Unique event/type intents; retains previous provider outcome fields |
+| `notifications` | Unique event/type intents, including reminder intents linked to delivery outcomes |
+| `notification_deliveries` | Dispatch claim, attempts, stable provider identity and outcome per appointment/generation |
+| `reminder_handoffs` | Durable start/signal acknowledgment or already-closed decision per event |
 | `analytics_events` | Deduplicated activity with appointment, event type, source time and processing time |
-| `mock_provider_acceptances` | Retained storage from the previous mock-provider exercise; unused by these consumers |
+| `mock_provider_acceptances` | Independent durable acceptance/deduplication storage for the local fake provider |
 
 `idx_events_appointment_id` indexes appointment event-history lookups. Primary
 keys also create indexes. There is no patient demographics table.
@@ -507,5 +579,5 @@ docker compose exec db psql -U careflow -d careflow -c 'TABLE analytics_events;'
 ```
 
 Source event ordering, cancellation-before-scheduling recovery, authorization,
-connection pooling, burst control, rescheduling, cancellation signals, notification
-delivery, Redis and production observability remain outside the implemented milestones.
+connection pooling, burst control, real SMS integration, automated reconciliation
+of uncertain deliveries, Redis and production observability remain outside these milestones.

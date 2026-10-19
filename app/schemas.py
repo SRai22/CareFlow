@@ -14,7 +14,7 @@ class EventCreate(BaseModel):
     event_id: Identifier
     patient_id: Identifier
     appointment_id: Identifier
-    event_type: Literal["APPOINTMENT_SCHEDULED", "APPOINTMENT_CANCELLED"]
+    event_type: Literal["APPOINTMENT_SCHEDULED", "APPOINTMENT_RESCHEDULED", "APPOINTMENT_CANCELLED"]
     event_version: Annotated[int, Field(strict=True, gt=0, le=2_147_483_647)]
     occurred_at: AwareDatetime
     # Nullable for historical events; new scheduling transactions require a future value.
@@ -24,6 +24,10 @@ class EventCreate(BaseModel):
     @classmethod
     def normalize_timestamps(cls, value: datetime | None) -> datetime | None:
         return value.astimezone(timezone.utc) if value is not None else None
+
+
+class StoredEvent(EventCreate):
+    schedule_generation: Annotated[int, Field(strict=True, gt=0)] | None = None
 
 
 class EventRead(EventCreate):
@@ -37,3 +41,4 @@ class AppointmentRead(BaseModel):
     last_event_id: str
     updated_at: datetime
     scheduled_for: datetime | None = None
+    schedule_generation: int = 1

@@ -18,7 +18,7 @@ def test_api_outbox_kafka_key_and_http_replay(client, event, connection, kafka):
     reader = kafka.reader()
     record = kafka.read(reader)
     assert record.key() == b"appt_123"
-    assert json.loads(record.value()) == EventCreate(**event).model_dump(mode="json")
+    assert json.loads(record.value()) == {**EventCreate(**event).model_dump(mode="json"), "schedule_generation": 1}
     retry = client.post("/events", json=event)
     assert retry.status_code == 201
     assert retry.content == response.content

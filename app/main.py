@@ -8,7 +8,7 @@ from psycopg.errors import UniqueViolation
 from app.db import get_connection
 from app.idempotency import request_hash
 from app.schemas import AppointmentRead, EventCreate, EventRead, Identifier
-from app.transactions import InvalidSchedule, cancel_appointment, schedule_appointment
+from app.transactions import InvalidSchedule, InvalidTransition, cancel_appointment, reschedule_appointment, schedule_appointment
 
 app = FastAPI(title="CareFlow", version="0.1.0")
 Connection = Annotated[psycopg.Connection[dict[str, Any]], Depends(get_connection)]
@@ -28,10 +28,14 @@ def create_event(event: EventCreate, connection: Connection):
     try:
         if event.event_type == "APPOINTMENT_SCHEDULED":
             stored = schedule_appointment(event, connection)
+        elif event.event_type == "APPOINTMENT_RESCHEDULED":
+            stored = reschedule_appointment(event, connection)
         else:
             stored = cancel_appointment(event, connection)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+    except InvalidTransition as exc:
+        raise HTTPException(409, str(exc)) from exc
     except InvalidSchedule as exc:
         raise HTTPException(422, str(exc)) from exc
     except UniqueViolation as exc:

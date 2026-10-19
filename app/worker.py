@@ -6,7 +6,7 @@ from confluent_kafka import Consumer, KafkaException
 
 from app.db import open_connection
 from app.kafka import TOPIC, bootstrap_servers
-from app.schemas import EventCreate
+from app.schemas import StoredEvent
 from app.temporal_client import TemporalHandoffError
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ def process_record(consumer, record, handler, *, checkpoint=None) -> None:
         raise KafkaException(record.error())
     if checkpoint is not None:
         checkpoint("before_processing", record)
-    event = EventCreate.model_validate_json(record.value())
+    event = StoredEvent.model_validate_json(record.value())
     if record.key() != event.appointment_id.encode("utf-8"):
         raise ValueError("Kafka key does not match appointment_id")
 

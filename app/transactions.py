@@ -12,6 +12,10 @@ class InvalidSchedule(ValueError):
     pass
 
 
+class InvalidTransition(ValueError):
+    pass
+
+
 def _insert_event(
     event: EventCreate,
     connection: psycopg.Connection[dict[str, Any]],
@@ -68,6 +72,8 @@ def schedule_appointment(
             event.model_dump(),
         )
 
+        stored = _stored_generation(connection, stored, 1)
+
     return stored
 
 
@@ -79,7 +85,7 @@ def cancel_appointment(
         # Serialize this transition so concurrent cancellations cannot both warrant a notice.
         previous = connection.execute(
             """
-            SELECT status FROM appointments
+            SELECT status, schedule_generation FROM appointments
             WHERE appointment_id = %(appointment_id)s AND patient_id = %(patient_id)s
             FOR UPDATE
             """,
@@ -108,4 +114,56 @@ def cancel_appointment(
                 (event.event_id,),
             ).fetchone()
 
+        _invalidate_deliveries(connection, event.appointment_id, previous["schedule_generation"], "CANCELLED")
+        stored = _stored_generation(connection, stored, previous["schedule_generation"])
+
+    return stored
+
+
+
+def _stored_generation(connection, stored, generation):
+    stored = connection.execute(
+        "UPDATE events SET schedule_generation = %s WHERE event_id = %s RETURNING *",
+        (generation, stored["event_id"]),
+    ).fetchone()
+    connection.execute(
+        "UPDATE outbox SET payload = payload || %s WHERE event_id = %s",
+        (Jsonb({"schedule_generation": generation}), stored["event_id"]),
+    )
+    return stored
+
+
+def _invalidate_deliveries(connection, appointment_id, generation, reason):
+    connection.execute(
+        """UPDATE notification_deliveries
+           SET invalidated_at = COALESCE(invalidated_at, clock_timestamp()), invalidation_reason = %s
+           WHERE appointment_id = %s AND schedule_generation = %s""",
+        (reason, appointment_id, generation),
+    )
+
+
+def reschedule_appointment(event: EventCreate, connection):
+    with connection.transaction():
+        stored = _insert_event(event, connection)
+        if event.scheduled_for is None or event.scheduled_for <= datetime.now(timezone.utc):
+            raise InvalidSchedule("APPOINTMENT_RESCHEDULED requires a future scheduled_for timestamp")
+        previous = connection.execute(
+            """SELECT status, schedule_generation FROM appointments
+               WHERE appointment_id = %(appointment_id)s AND patient_id = %(patient_id)s FOR UPDATE""",
+            event.model_dump(),
+        ).fetchone()
+        if previous is None:
+            raise LookupError("Appointment not found for the supplied patient")
+        if previous["status"] != "SCHEDULED":
+            raise InvalidTransition("Only a scheduled appointment can be rescheduled")
+        generation = previous["schedule_generation"] + 1
+        connection.execute(
+            """UPDATE appointments SET scheduled_for = %(scheduled_for)s,
+                   schedule_generation = %(generation)s, last_event_id = %(event_id)s,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE appointment_id = %(appointment_id)s AND patient_id = %(patient_id)s""",
+            {**event.model_dump(), "generation": generation},
+        )
+        _invalidate_deliveries(connection, event.appointment_id, previous["schedule_generation"], "RESCHEDULED")
+        stored = _stored_generation(connection, stored, generation)
     return stored

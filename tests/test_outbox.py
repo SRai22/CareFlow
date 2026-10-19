@@ -18,7 +18,7 @@ def test_outbox_is_atomic_and_retries_do_not_add_rows(client, event, connection)
     assert client.post("/events", json=event).status_code == 201
     original = rows(connection)
     assert len(original) == 1
-    assert original[0]["payload"] == EventCreate(**event).model_dump(mode="json")
+    assert original[0]["payload"] == {**EventCreate(**event).model_dump(mode="json"), "schedule_generation": 1}
     assert original[0]["published_at"] is None
     assert client.post("/events", json=event).status_code == 201
     assert client.post("/events", json={**event, "patient_id": "wrong"}).status_code == 409
