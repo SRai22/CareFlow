@@ -5,6 +5,10 @@ committed events through a transactional outbox to Kafka. Independent consumers
 persist notification intents and analytics activity. This milestone sends no SMS
 and calls no notification provider.
 
+Milestone 4.1 also provides a separate Temporal durable-timer demo. It establishes
+workflow persistence and worker recovery before connecting appointment reminders
+to the event pipeline.
+
 ```text
 POST /events → PostgreSQL transaction [event + appointment + outbox] → 201
                                       ↓
@@ -16,8 +20,8 @@ POST /events → PostgreSQL transaction [event + appointment + outbox] → 201
                 notifications                  analytics_events
 ```
 
-Python 3.12+ and Docker Compose are required. PostgreSQL and Kafka run in Docker;
-the API, relay and consumers run locally.
+Python 3.12+ and Docker Compose are required. PostgreSQL, Kafka and Temporal run
+in Docker; the API, relay, consumers and Temporal worker run locally.
 
 ## Run locally
 
@@ -25,7 +29,7 @@ the API, relay and consumers run locally.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
-docker compose up -d --wait db kafka
+docker compose up -d --wait db kafka temporal
 docker compose run --rm kafka-init
 export DATABASE_URL='postgresql://careflow:careflow@localhost:5432/careflow'
 export KAFKA_BOOTSTRAP_SERVERS='localhost:9092'
@@ -295,6 +299,90 @@ Broker outage injection, a DLQ policy, lag measurement and multi-consumer
 assignment tests remain the next recovery exercises. Poison records still stop
 the current worker under the existing explicit error policy.
 
+## Temporal foundation — Milestone 4.1
+
+Compose includes the pinned `temporalio/temporal:1.9.1` development server.
+Its gRPC endpoint is `localhost:7233` and its Web UI is
+<http://localhost:8233>. It automatically creates the `default` namespace.
+Clients on the Compose network can connect to `temporal:7233`.
+
+The server uses `--db-filename /home/temporal/temporal.db` backed by the named
+`temporal_data` volume. Workflow history survives server/container restarts and
+recreation while the volume is retained. This SQLite store is Temporal's local
+execution history; PostgreSQL remains CareFlow's appointment source of truth.
+The development server is for local learning. A production Temporal deployment
+has different persistence and operational requirements.
+[Temporal development server](https://github.com/temporalio/documentation/blob/main/docs/cli/setup-cli.mdx)
+
+```bash
+pip install -r requirements-dev.txt
+docker compose up -d --wait temporal
+export TEMPORAL_ADDRESS='localhost:7233'
+export TEMPORAL_NAMESPACE='default'
+python -m app.temporal_worker
+```
+
+The worker prints a JSON readiness message after registering
+`AppointmentReminderWorkflow` on the `careflow-reminders` task queue. In another
+terminal, activate the environment and start a workflow:
+
+```bash
+python -m app.start_reminder --appointment-id appt_temporal_demo \
+  --delay-seconds 30 --wait
+```
+
+The starter prints the workflow ID and run ID after the server acknowledges
+creation. `--wait` keeps the client open until completion; omitting it exits
+immediately after the acknowledgment. The client is not needed for the execution
+to continue. Connection settings default to the values above. Both commands
+accept `--task-queue` to isolate an exercise from other workers.
+
+Workflow IDs are deterministic: `appointment-reminder:{appointment_id}`. Starting
+the same appointment again exits with code 1, including after completion while
+the execution remains in Temporal's retention window. The starter explicitly
+rejects running conflicts and reuse of completed IDs rather than silently
+creating another execution. Use another synthetic appointment ID for another
+demo. The later Kafka handoff will need its own duplicate acknowledgment and
+request-identity policy.
+
+[app/workflows/appointment_reminder.py](app/workflows/appointment_reminder.py)
+only waits with `workflow.sleep(delay_seconds)` and returns a completion string.
+It performs no database queries or external side effects. This timer is recorded
+in Temporal history and replayed deterministically after a worker restart.
+[Temporal durable timers](https://docs.temporal.io/develop/python/workflows/timers)
+
+To observe recovery, start a 30-second workflow, stop its worker with Ctrl+C,
+let the timer expire, then restart `python -m app.temporal_worker`. The original
+run completes and the waiting client prints its result. The server can fire the
+timer without a worker, but a worker must process the next workflow task to
+complete the execution. Inspect the history in the Web UI, or use:
+
+```bash
+docker compose exec temporal temporal workflow show \
+  --workflow-id appointment-reminder:appt_temporal_demo
+```
+
+This is a timer demonstration using a supplied delay, rather than appointment
+time calculation. `scheduled_for`, rescheduling semantics, Kafka-to-Temporal
+handoff, cancellation signals, notification activities and send/cancel race
+policies belong to the following milestones. The current API does not start
+these demo workflows, and this worker sends no notification.
+
+Run the real-server integration tests with:
+
+```bash
+TEST_TEMPORAL_ADDRESS=localhost:7233 pytest -q tests/test_temporal.py
+```
+
+The tests use unique workflow IDs and task queues, without mutating application
+tables. They verify acknowledgment before any worker exists, reconnecting with
+a new client, rejection of duplicate starts, and durable timer recovery after
+SIGKILL of a worker subprocess. The crash test waits for `TimerStarted`, kills
+the worker, observes `TimerFired` while no worker is running, restarts it, and
+checks that the same run completes with exactly one timer in its history.
+Set `TEST_TEMPORAL_NAMESPACE` if using a namespace other than `default`. These
+tests explicitly skip when `TEST_TEMPORAL_ADDRESS` is unset.
+
 ## Tables
 
 See [app/schema.sql](app/schema.sql),
@@ -315,11 +403,12 @@ keys also create indexes. There is no patient demographics table.
 
 ## Verify
 
-With both services running and `appointments.events` initialized:
+With PostgreSQL, Kafka and Temporal running and `appointments.events` initialized:
 
 ```bash
 export TEST_DATABASE_URL='postgresql://careflow:careflow@localhost:5432/careflow'
 export TEST_KAFKA_BOOTSTRAP_SERVERS='localhost:9092'
+export TEST_TEMPORAL_ADDRESS='localhost:7233'
 pytest -q
 ```
 
@@ -357,5 +446,5 @@ docker compose exec db psql -U careflow -d careflow -c 'TABLE analytics_events;'
 ```
 
 Source event ordering, cancellation-before-scheduling recovery, authorization,
-connection pooling, burst control, Temporal, Redis and production observability
-remain outside this milestone.
+connection pooling, burst control, reminder business logic, Redis and production
+observability remain outside the implemented milestones.
